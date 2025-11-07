@@ -13,8 +13,36 @@ import functools
 import hashlib
 from diskcache import Cache
 import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import csv
+import io
+import os
 
 logger = logging.getLogger(__name__)
+
+# --- Yahoo session (retry + headers) ---
+_YAHOO_SESSION: requests.Session | None = None
+
+
+def _yahoo_session() -> requests.Session:
+	global _YAHOO_SESSION
+	if _YAHOO_SESSION is None:
+		s = requests.Session()
+		retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+		adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
+		s.mount("https://", adapter)
+		s.mount("http://", adapter)
+		_YAHOO_SESSION = s
+	return _YAHOO_SESSION
+
+
+def _yahoo_headers() -> Dict[str, str]:
+	return {
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+		"Accept": "application/json,text/plain,*/*",
+		"Connection": "keep-alive",
+	}
 
 
 REQUIRED_KEYS = [
@@ -68,6 +96,84 @@ def validate_and_normalize_output(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 _EMB_CACHE = Cache("emb_cache")
+_AV_CACHE = Cache("av_cache")
+
+# --- Alpha Vantage session (retry) ---
+_AV_SESSION: requests.Session | None = None
+
+
+def _av_session() -> requests.Session:
+	global _AV_SESSION
+	if _AV_SESSION is None:
+		s = requests.Session()
+		retry = Retry(total=3, backoff_factor=0.6, status_forcelist=[429, 500, 502, 503, 504])
+		adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
+		s.mount("https://", adapter)
+		s.mount("http://", adapter)
+		_AV_SESSION = s
+	return _AV_SESSION
+
+
+def _av_listing_status(api_key: str, allowed_exchanges: List[str]) -> Dict[str, str]:
+	"""Return mapping ticker -> exchange for active listings limited to allowed_exchanges.
+
+	Results cached on disk for 24 hours.
+	"""
+	key = f"listing_status:{','.join(sorted(allowed_exchanges)).upper()}"
+	row = _AV_CACHE.get(key, default=None)
+	if row is not None:
+		return row
+	url = f"https://www.alphavantage.co/query?function=LISTING_STATUS&state=active&apikey={api_key}"
+	r = _av_session().get(url, timeout=30)
+	r.raise_for_status()
+	content = r.text
+	buf = io.StringIO(content)
+	reader = csv.DictReader(buf)
+	allow = {e.upper() for e in allowed_exchanges}
+	mapping: Dict[str, str] = {}
+	for rec in reader:
+		symbol = (rec.get("symbol") or "").strip()
+		exchange = (rec.get("exchange") or "").strip().upper()
+		status = (rec.get("status") or "").strip().lower()
+		if not symbol or not exchange:
+			continue
+		if exchange not in allow:
+			continue
+		if status and status != "active":
+			continue
+		mapping[symbol.upper()] = exchange
+	# cache for 24h
+	_AV_CACHE.set(key, mapping, expire=24 * 3600)
+	return mapping
+
+
+def filter_us_active_listed(
+	comparables: List[Dict[str, Any]],
+	alpha_vantage_api_key: str,
+	allowed_exchanges: List[str] | None = None,
+) -> Dict[str, Any]:
+	"""Keep only U.S. active listings on allowed U.S. exchanges using Alpha Vantage LISTING_STATUS.
+
+	Sets exchange from AV mapping when present.
+	"""
+	allowed = allowed_exchanges or ["NYSE", "NASDAQ", "AMEX"]
+	if not alpha_vantage_api_key:
+		# If no key, conservatively return empty list to avoid mislabeling
+		logger.warning("Alpha Vantage key missing; cannot filter by active listing")
+		return {"comparables": []}
+	mapping = _av_listing_status(alpha_vantage_api_key, allowed)
+	kept: List[Dict[str, Any]] = []
+	for comp in comparables:
+		sym = (comp.get("ticker") or comp.get("symbol") or "").strip().upper()
+		if not sym:
+			continue
+		exch = mapping.get(sym)
+		if not exch:
+			continue
+		new_c = dict(comp)
+		new_c["exchange"] = exch
+		kept.append(new_c)
+	return {"comparables": kept}
 
 def _hash_id(text: str, model: str) -> str:
 	return f"{model}:" + hashlib.sha256((model + '::' + (text or '')).encode('utf-8')).hexdigest()
@@ -244,7 +350,7 @@ def _yahoo_quote(symbol: str) -> Dict[str, Any]:
 	try:
 		logger.info("Yahoo quote lookup for %s", symbol)
 		url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={quote(symbol)}"
-		r = requests.get(url, timeout=10)
+		r = _yahoo_session().get(url, headers=_yahoo_headers(), timeout=10)
 		r.raise_for_status()
 		data = r.json() or {}
 		results = ((data.get("quoteResponse") or {}).get("result") or [])
@@ -260,7 +366,7 @@ def _yahoo_autocomplete(query: str) -> List[Dict[str, Any]]:
 	try:
 		logger.info("Yahoo autocomplete for %s", query)
 		url = f"https://autoc.finance.yahoo.com/autoc?lang=en&region=US&query={quote(query)}"
-		r = requests.get(url, timeout=10)
+		r = _yahoo_session().get(url, headers=_yahoo_headers(), timeout=10)
 		r.raise_for_status()
 		data = r.json() or {}
 		return ((data.get("ResultSet") or {}).get("Result") or [])
@@ -294,63 +400,66 @@ def _normalize_exchange(quote_obj: Dict[str, Any]) -> str:
 
 
 def ground_ticker_exchange(comparables: List[Dict[str, Any]]) -> Dict[str, Any]:
-	"""Cross-check ticker and exchange using Yahoo Finance; update when confident, else keep original.
+    """Ground tickers using SEC company_tickers mapping; leave exchange as-is or 'unknown'.
 
-	Returns {"comparables": updated_list} preserving other fields.
-	"""
-	updated: List[Dict[str, Any]] = []
-	changed = 0
-	for comp in comparables:
-		name = comp.get("name") or ""
-		ticker = (comp.get("ticker") or "").strip()
-		original_exchange = comp.get("exchange") or ""
-		best_symbol = ticker
-		best_exchange = original_exchange
-		# 1) If ticker present, verify via quote
-		if ticker:
-			q = _yahoo_quote(ticker)
-			q_name = q.get("longName") or q.get("shortName") or ""
-			if q.get("symbol") and _name_matches(name, q_name, threshold=0.4):
-				best_symbol = q.get("symbol")
-				best_exchange = _normalize_exchange(q)
-			else:
-				# If mismatch, try autocomplete then VALIDATE via quote
-				cands = _yahoo_autocomplete(name)
-				for c in cands:
-					c_name = c.get("name") or ""
-					sym = c.get("symbol") or ""
-					if not sym:
-						continue
-					if _name_matches(name, c_name, threshold=0.5):
-						q2 = _yahoo_quote(sym)
-						if q2.get("symbol"):
-							best_symbol = q2.get("symbol")
-							best_exchange = _normalize_exchange(q2)
-							break
-		else:
-			# 2) No ticker -> autocomplete by name
-			cands = _yahoo_autocomplete(name)
-			for c in cands:
-				c_name = c.get("name") or ""
-				sym = c.get("symbol") or ""
-				if not sym:
-					continue
-				if _name_matches(name, c_name, threshold=0.5):
-					q2 = _yahoo_quote(sym)
-					if q2.get("symbol"):
-						best_symbol = q2.get("symbol") or best_symbol
-						best_exchange = _normalize_exchange(q2) or best_exchange
-						break
-		new_comp = dict(comp)
-		if best_symbol:
-			new_comp["ticker"] = best_symbol
-		if best_exchange:
-			new_comp["exchange"] = best_exchange
-		if new_comp.get("ticker") != comp.get("ticker") or new_comp.get("exchange") != comp.get("exchange"):
-			changed += 1
-		updated.append(new_comp)
-	logger.info("Ticker/exchange grounding: processed=%s changed=%s", len(comparables), changed)
-	return {"comparables": updated}
+    Returns {"comparables": updated_list} preserving other fields.
+    """
+
+    @functools.lru_cache(maxsize=1)
+    def _sec_index_by_ticker() -> Dict[str, Dict[str, Any]]:
+        data = _sec_company_tickers()
+        idx: Dict[str, Dict[str, Any]] = {}
+        try:
+            for _, v in (data.items() if isinstance(data, dict) else []):
+                t = (v.get("ticker") or "").strip()
+                if t:
+                    idx[t.lower()] = v
+        except Exception:
+            pass
+        return idx
+
+    def _sec_find_by_name(nm: str) -> Dict[str, Any] | None:
+        if not nm:
+            return None
+        data = _sec_company_tickers()
+        best: Tuple[int, Dict[str, Any]] | None = None
+        try:
+            t_tokens = _token_set(nm)
+            for _, v in (data.items() if isinstance(data, dict) else []):
+                title = (v.get("title") or "").strip()
+                if not title:
+                    continue
+                score = len(t_tokens & _token_set(title))
+                if score > 0 and (best is None or score > best[0]):
+                    best = (score, v)
+        except Exception:
+            return None
+        return best[1] if best else None
+
+    idx = _sec_index_by_ticker()
+    updated: List[Dict[str, Any]] = []
+    changed = 0
+    for comp in comparables:
+        name = (comp.get("name") or "").strip()
+        ticker = (comp.get("ticker") or comp.get("symbol") or "").strip()
+        new_comp = dict(comp)
+        rec: Dict[str, Any] | None = None
+        if ticker:
+            rec = idx.get(ticker.lower())
+            if not rec:
+                rec = _sec_find_by_name(name)
+        else:
+            rec = _sec_find_by_name(name)
+        if rec:
+            sec_tkr = (rec.get("ticker") or "").strip()
+            if sec_tkr and sec_tkr != new_comp.get("ticker"):
+                new_comp["ticker"] = sec_tkr
+                changed += 1
+        # Keep or set exchange
+        new_comp["exchange"] = (new_comp.get("exchange") or "unknown").strip() or "unknown"
+        updated.append(new_comp)
+    logger.info("Ticker grounding via SEC: processed=%s changed=%s", len(comparables), changed)
+    return {"comparables": updated}
 
 
 def _is_active_equity(q: Dict[str, Any], expected_name: str) -> bool:
@@ -379,6 +488,18 @@ def filter_listed_public_equities(comparables: List[Dict[str, Any]], min_keep: i
 	return {"comparables": filtered}
 
 
+def filter_us_sec_registrants(comparables: List[Dict[str, Any]]) -> Dict[str, Any]:
+	"""Keep only U.S. SEC registrants (CIK must resolve by ticker or name)."""
+	kept: List[Dict[str, Any]] = []
+	for comp in comparables:
+		name = (comp.get("name") or "").strip()
+		sym = (comp.get("ticker") or comp.get("symbol") or "").strip()
+		cik = sec_get_cik_by_ticker(sym) or sec_get_cik_by_name(name)
+		if cik:
+			kept.append(comp)
+	return {"comparables": kept}
+
+
 # --- Similarity scoring (embeddings + optional enrichment) ---
 
 # --- SEC (EDGAR) enrichment utilities ---
@@ -387,13 +508,35 @@ SEC_USER_AGENT = "ComparableFinder/1.0 (Fordham DS; contact: vamrutha.works@gmai
 
 
 def _sec_headers() -> Dict[str, str]:
-	return {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate", "Host": "www.sec.gov"}
+	return {
+		"User-Agent": SEC_USER_AGENT,
+		"Accept-Encoding": "gzip, deflate",
+		"Host": "www.sec.gov",
+		"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		"Connection": "keep-alive",
+		"Referer": "https://www.sec.gov/",
+	}
+
+
+_SEC_SESSION: requests.Session | None = None
+
+
+def _sec_session() -> requests.Session:
+	global _SEC_SESSION
+	if _SEC_SESSION is None:
+		s = requests.Session()
+		retry = Retry(total=3, backoff_factor=0.6, status_forcelist=[429, 500, 502, 503, 504])
+		adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
+		s.mount("https://", adapter)
+		s.mount("http://", adapter)
+		_SEC_SESSION = s
+	return _SEC_SESSION
 
 
 @functools.lru_cache(maxsize=1)
 def _sec_company_tickers() -> Dict[str, Any]:
 	url = "https://www.sec.gov/files/company_tickers.json"
-	resp = requests.get(url, headers=_sec_headers(), timeout=20)
+	resp = _sec_session().get(url, headers=_sec_headers(), timeout=20)
 	resp.raise_for_status()
 	return resp.json() or {}
 
@@ -430,28 +573,50 @@ def sec_get_latest_filing_text(cik: str) -> str:
 		return ""
 	subm_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
 	logger.info("Fetching SEC submissions for CIK=%s", cik)
-	subm = requests.get(subm_url, headers=_sec_headers(), timeout=20).json()
+	subm = _sec_session().get(subm_url, headers=_sec_headers(), timeout=20).json()
 	recent = ((subm.get("filings") or {}).get("recent") or {})
 	forms = recent.get("form") or []
 	accessions = recent.get("accessionNumber") or []
 	primaries = recent.get("primaryDocument") or []
 	preferred: List[int] = []
-	preferred += [i for i, f in enumerate(forms) if f == "10-K"]
-	preferred += [i for i, f in enumerate(forms) if f == "10-Q"]
+	for code in ["10-K", "20-F", "40-F", "10-Q", "6-K"]:
+		preferred += [i for i, f in enumerate(forms) if f == code]
 	for i in preferred:
 		if i >= len(accessions) or i >= len(primaries):
 			continue
 		accession = (accessions[i] or "").replace("-", "")
-		primary = primaries[i] or ""
-		if not accession or not primary or not primary.lower().endswith((".htm", ".html")):
+		primary = (primaries[i] or "").strip()
+		if not accession:
 			continue
-		file_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary}"
+		candidates: List[str] = []
+		if primary and primary.lower().endswith((".htm", ".html", ".txt")):
+			candidates.append(f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary}")
+		# Fallback: probe the directory index.json for an html/txt document
+		index_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/index.json"
 		try:
-			logger.info("Fetching SEC filing %s", file_url)
-			return requests.get(file_url, headers=_sec_headers(), timeout=30).text
+			idx = _sec_session().get(index_url, headers=_sec_headers(), timeout=20)
+			if idx.ok:
+				data = idx.json()
+				items = ((data.get("directory") or {}).get("item") or [])
+				for it in items:
+					href = (it.get("href") or "").strip()
+					if href.lower().endswith((".htm", ".html")):
+						candidates.append(f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{href}")
+				for it in items:
+					href = (it.get("href") or "").strip()
+					if href.lower().endswith((".txt",)):
+						candidates.append(f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{href}")
 		except Exception:
-			logger.exception("Failed to fetch SEC filing %s", file_url)
-			continue
+			pass
+		for url in candidates:
+			try:
+				logger.info("Fetching SEC filing %s", url)
+				r = _sec_session().get(url, headers=_sec_headers(), timeout=30)
+				r.raise_for_status()
+				return r.text
+			except Exception:
+				logger.exception("Failed to fetch SEC filing %s", url)
+				continue
 	return ""
 
 

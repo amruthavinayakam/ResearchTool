@@ -303,7 +303,11 @@ class ComparableFinder:
 					return None
 				url2 = (profile.get("weburl") or "").strip()
 				industry = (profile.get("finnhubIndustry") or "").strip()
-				return {"name": name2, "url": url2, "context": industry, "title": name2, "symbol": sym}
+				country = (profile.get("country") or "").strip()
+				# Enforce US-only at the source
+				if country and country.upper() != "US":
+					return None
+				return {"name": name2, "url": url2, "context": industry, "title": name2, "symbol": sym, "country": country}
 			except Exception:
 				return None
 		candidates: List[Dict[str, str]] = []
@@ -325,7 +329,7 @@ class ComparableFinder:
 				"You are given a target company and a list of candidate companies. "
 				"Return a JSON object with key 'comparables' containing 3 to 10 entries. "
 				"Choose ONLY from the provided candidates; do not add companies not present in the candidate list. "
-				"Return ONLY PUBLICLY TRADED COMPANIES whose products/services and customer segments are similar to the target (NO PRIVATE COMPANIES). "
+				"Return ONLY PUBLICLY TRADED U.S. COMPANIES (listed on NYSE, NASDAQ, or AMEX) whose products/services and customer segments are similar to the target. NO PRIVATE OR NON-U.S. COMPANIES. "
 				"Use provided snippets and any provided ticker/symbol fields to infer fields. If ticker/exchange cannot be determined confidently, write 'unknown'. "
 				"Fields per comparable (exact keys): name, url, exchange, ticker, business_activity, customer_segment, SIC_industry. "
 				"For SIC_industry, output the SIC industry group name(s), absolutely do NOT include any numeric SIC codes or numbers, "
@@ -343,8 +347,8 @@ class ComparableFinder:
 		else:
 			instruction = (
 				"You are given a target company. "
-				"Return a JSON object with key 'comparables' containing 3 to 10 entries of PUBLICLY TRADED COMPANIES "
-				"whose products/services and customer segments are similar to the target (NO PRIVATE COMPANIES). "
+				"Return a JSON object with key 'comparables' containing 3 to 10 entries of PUBLICLY TRADED U.S. COMPANIES (NYSE, NASDAQ, AMEX only). "
+				"Companies must be U.S. registrants (SIC is U.S.-specific). NO PRIVATE OR NON-U.S. COMPANIES. "
 				"If ticker/exchange cannot be determined confidently, write 'unknown'. "
 				"Fields per comparable (exact keys): name, url, exchange, ticker, business_activity, customer_segment, SIC_industry. "
 				"For SIC_industry, output the SIC industry group name(s), absolutely do NOT include any numeric SIC codes or numbers."
