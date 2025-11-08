@@ -5,45 +5,14 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 from openai import OpenAI
-import requests
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 import re
-from bs4 import BeautifulSoup
 import functools
 import hashlib
 from diskcache import Cache
 import logging
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import csv
-import io
-import os
 
 logger = logging.getLogger(__name__)
-
-# --- Yahoo session (retry + headers) ---
-_YAHOO_SESSION: requests.Session | None = None
-
-
-def _yahoo_session() -> requests.Session:
-	global _YAHOO_SESSION
-	if _YAHOO_SESSION is None:
-		s = requests.Session()
-		retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
-		adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
-		s.mount("https://", adapter)
-		s.mount("http://", adapter)
-		_YAHOO_SESSION = s
-	return _YAHOO_SESSION
-
-
-def _yahoo_headers() -> Dict[str, str]:
-	return {
-		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
-		"Accept": "application/json,text/plain,*/*",
-		"Connection": "keep-alive",
-	}
-
 
 REQUIRED_KEYS = [
 	"name",
@@ -96,84 +65,6 @@ def validate_and_normalize_output(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 _EMB_CACHE = Cache("emb_cache")
-_AV_CACHE = Cache("av_cache")
-
-# --- Alpha Vantage session (retry) ---
-_AV_SESSION: requests.Session | None = None
-
-
-def _av_session() -> requests.Session:
-	global _AV_SESSION
-	if _AV_SESSION is None:
-		s = requests.Session()
-		retry = Retry(total=3, backoff_factor=0.6, status_forcelist=[429, 500, 502, 503, 504])
-		adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
-		s.mount("https://", adapter)
-		s.mount("http://", adapter)
-		_AV_SESSION = s
-	return _AV_SESSION
-
-
-def _av_listing_status(api_key: str, allowed_exchanges: List[str]) -> Dict[str, str]:
-	"""Return mapping ticker -> exchange for active listings limited to allowed_exchanges.
-
-	Results cached on disk for 24 hours.
-	"""
-	key = f"listing_status:{','.join(sorted(allowed_exchanges)).upper()}"
-	row = _AV_CACHE.get(key, default=None)
-	if row is not None:
-		return row
-	url = f"https://www.alphavantage.co/query?function=LISTING_STATUS&state=active&apikey={api_key}"
-	r = _av_session().get(url, timeout=30)
-	r.raise_for_status()
-	content = r.text
-	buf = io.StringIO(content)
-	reader = csv.DictReader(buf)
-	allow = {e.upper() for e in allowed_exchanges}
-	mapping: Dict[str, str] = {}
-	for rec in reader:
-		symbol = (rec.get("symbol") or "").strip()
-		exchange = (rec.get("exchange") or "").strip().upper()
-		status = (rec.get("status") or "").strip().lower()
-		if not symbol or not exchange:
-			continue
-		if exchange not in allow:
-			continue
-		if status and status != "active":
-			continue
-		mapping[symbol.upper()] = exchange
-	# cache for 24h
-	_AV_CACHE.set(key, mapping, expire=24 * 3600)
-	return mapping
-
-
-def filter_us_active_listed(
-	comparables: List[Dict[str, Any]],
-	alpha_vantage_api_key: str,
-	allowed_exchanges: List[str] | None = None,
-) -> Dict[str, Any]:
-	"""Keep only U.S. active listings on allowed U.S. exchanges using Alpha Vantage LISTING_STATUS.
-
-	Sets exchange from AV mapping when present.
-	"""
-	allowed = allowed_exchanges or ["NYSE", "NASDAQ", "AMEX"]
-	if not alpha_vantage_api_key:
-		# If no key, conservatively return empty list to avoid mislabeling
-		logger.warning("Alpha Vantage key missing; cannot filter by active listing")
-		return {"comparables": []}
-	mapping = _av_listing_status(alpha_vantage_api_key, allowed)
-	kept: List[Dict[str, Any]] = []
-	for comp in comparables:
-		sym = (comp.get("ticker") or comp.get("symbol") or "").strip().upper()
-		if not sym:
-			continue
-		exch = mapping.get(sym)
-		if not exch:
-			continue
-		new_c = dict(comp)
-		new_c["exchange"] = exch
-		kept.append(new_c)
-	return {"comparables": kept}
 
 def _hash_id(text: str, model: str) -> str:
 	return f"{model}:" + hashlib.sha256((model + '::' + (text or '')).encode('utf-8')).hexdigest()
@@ -238,30 +129,30 @@ def _simple_extract_keywords(text: str, max_tokens: int = 12) -> List[str]:
 
 
 def _build_candidate_text(c: Dict[str, Any]) -> str:
-    parts = [
-        c.get("name") or "",
-        c.get("business_activity") or "",
-        c.get("customer_segment") or "",
-        c.get("SIC_industry") or "",
-    ]
-    url = c.get("url") or ""
-    try:
-        domain = urlparse(url).netloc
-        if domain:
-            parts.append(domain)
-    except Exception:
-        pass
-    return " \n".join(p for p in parts if p)
+	parts = [
+		c.get("name") or "",
+		c.get("business_activity") or "",
+		c.get("customer_segment") or "",
+		c.get("SIC_industry") or "",
+	]
+	url = c.get("url") or ""
+	try:
+		domain = urlparse(url).netloc
+		if domain:
+			parts.append(domain)
+	except Exception:
+		pass
+	return " \n".join(p for p in parts if p)
 
 
 def _min_max_scale(values: List[float]) -> List[float]:
-    if not values:
-        return values
-    vmin = min(values)
-    vmax = max(values)
-    if vmax - vmin == 0:
-        return [0.5 for _ in values]
-    return [(v - vmin) / (vmax - vmin) for v in values]
+	if not values:
+		return values
+	vmin = min(values)
+	vmax = max(values)
+	if vmax - vmin == 0:
+		return [0.5 for _ in values]
+	return [(v - vmin) / (vmax - vmin) for v in values]
 
 
 def rank_and_filter_by_similarity(
@@ -344,37 +235,6 @@ def add_reasoning_notes(target_description: str, target_name: str, comparables: 
 	return {"comparables": updated}
 
 
-@functools.lru_cache(maxsize=2048)
-def _yahoo_quote(symbol: str) -> Dict[str, Any]:
-	"""Fetch quote details for a symbol from Yahoo Finance. Returns {} if not found."""
-	try:
-		logger.info("Yahoo quote lookup for %s", symbol)
-		url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={quote(symbol)}"
-		r = _yahoo_session().get(url, headers=_yahoo_headers(), timeout=10)
-		r.raise_for_status()
-		data = r.json() or {}
-		results = ((data.get("quoteResponse") or {}).get("result") or [])
-		return results[0] if results else {}
-	except Exception:
-		logger.exception("Yahoo quote failed for %s", symbol)
-		return {}
-
-
-@functools.lru_cache(maxsize=2048)
-def _yahoo_autocomplete(query: str) -> List[Dict[str, Any]]:
-	"""Use Yahoo autocomplete to search symbols by name. Returns list of candidates."""
-	try:
-		logger.info("Yahoo autocomplete for %s", query)
-		url = f"https://autoc.finance.yahoo.com/autoc?lang=en&region=US&query={quote(query)}"
-		r = _yahoo_session().get(url, headers=_yahoo_headers(), timeout=10)
-		r.raise_for_status()
-		data = r.json() or {}
-		return ((data.get("ResultSet") or {}).get("Result") or [])
-	except Exception:
-		logger.exception("Yahoo autocomplete failed for %s", query)
-		return []
-
-
 def _token_set(text: str) -> set:
 	return {t.lower() for t in (text or "").split() if t.isalpha() or t.isalnum()}
 
@@ -390,328 +250,7 @@ def _name_matches(target_name: str, candidate_name: str, threshold: float = 0.5)
 	return (inter / float(min(len(t), len(c)))) >= threshold
 
 
-def _normalize_exchange(quote_obj: Dict[str, Any]) -> str:
-	return (
-		quote_obj.get("fullExchangeName")
-		or quote_obj.get("exchangeDisplay")
-		or quote_obj.get("exchange")
-		or "unknown"
-	)
-
-
-def ground_ticker_exchange(comparables: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Ground tickers using SEC company_tickers mapping; leave exchange as-is or 'unknown'.
-
-    Returns {"comparables": updated_list} preserving other fields.
-    """
-
-    @functools.lru_cache(maxsize=1)
-    def _sec_index_by_ticker() -> Dict[str, Dict[str, Any]]:
-        data = _sec_company_tickers()
-        idx: Dict[str, Dict[str, Any]] = {}
-        try:
-            for _, v in (data.items() if isinstance(data, dict) else []):
-                t = (v.get("ticker") or "").strip()
-                if t:
-                    idx[t.lower()] = v
-        except Exception:
-            pass
-        return idx
-
-    def _sec_find_by_name(nm: str) -> Dict[str, Any] | None:
-        if not nm:
-            return None
-        data = _sec_company_tickers()
-        best: Tuple[int, Dict[str, Any]] | None = None
-        try:
-            t_tokens = _token_set(nm)
-            for _, v in (data.items() if isinstance(data, dict) else []):
-                title = (v.get("title") or "").strip()
-                if not title:
-                    continue
-                score = len(t_tokens & _token_set(title))
-                if score > 0 and (best is None or score > best[0]):
-                    best = (score, v)
-        except Exception:
-            return None
-        return best[1] if best else None
-
-    idx = _sec_index_by_ticker()
-    updated: List[Dict[str, Any]] = []
-    changed = 0
-    for comp in comparables:
-        name = (comp.get("name") or "").strip()
-        ticker = (comp.get("ticker") or comp.get("symbol") or "").strip()
-        new_comp = dict(comp)
-        rec: Dict[str, Any] | None = None
-        if ticker:
-            rec = idx.get(ticker.lower())
-            if not rec:
-                rec = _sec_find_by_name(name)
-        else:
-            rec = _sec_find_by_name(name)
-        if rec:
-            sec_tkr = (rec.get("ticker") or "").strip()
-            if sec_tkr and sec_tkr != new_comp.get("ticker"):
-                new_comp["ticker"] = sec_tkr
-                changed += 1
-        # Keep or set exchange
-        new_comp["exchange"] = (new_comp.get("exchange") or "unknown").strip() or "unknown"
-        updated.append(new_comp)
-    logger.info("Ticker grounding via SEC: processed=%s changed=%s", len(comparables), changed)
-    return {"comparables": updated}
-
-
-def _is_active_equity(q: Dict[str, Any], expected_name: str) -> bool:
-	if not q or not q.get("symbol"):
-		return False
-	if (q.get("quoteType") or "").upper() != "EQUITY":
-		return False
-	# Require live market price (delisted often lacks this)
-	if q.get("regularMarketPrice") is None:
-		return False
-	qname = q.get("longName") or q.get("shortName") or ""
-	return (not expected_name) or _name_matches(expected_name, qname, threshold=0.4)
-
-
-def filter_listed_public_equities(comparables: List[Dict[str, Any]], min_keep: int = 3) -> Dict[str, Any]:
-	"""Keep only active, listed equities (Yahoo quote with price), no fallback."""
-	filtered: List[Dict[str, Any]] = []
-	for comp in comparables:
-		sym = (comp.get("ticker") or "").strip()
-		name = comp.get("name") or ""
-		if not sym:
-			continue
-		q = _yahoo_quote(sym)
-		if _is_active_equity(q, name):
-			filtered.append(comp)
-	return {"comparables": filtered}
-
-
-def filter_us_sec_registrants(comparables: List[Dict[str, Any]]) -> Dict[str, Any]:
-	"""Keep only U.S. SEC registrants (CIK must resolve by ticker or name)."""
-	kept: List[Dict[str, Any]] = []
-	for comp in comparables:
-		name = (comp.get("name") or "").strip()
-		sym = (comp.get("ticker") or comp.get("symbol") or "").strip()
-		cik = sec_get_cik_by_ticker(sym) or sec_get_cik_by_name(name)
-		if cik:
-			kept.append(comp)
-	return {"comparables": kept}
-
-
 # --- Similarity scoring (embeddings + optional enrichment) ---
-
-# --- SEC (EDGAR) enrichment utilities ---
-
-SEC_USER_AGENT = "ComparableFinder/1.0 (Fordham DS; contact: vamrutha.works@gmail.com)"
-
-
-def _sec_headers() -> Dict[str, str]:
-	return {
-		"User-Agent": SEC_USER_AGENT,
-		"Accept-Encoding": "gzip, deflate",
-		"Host": "www.sec.gov",
-		"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-		"Connection": "keep-alive",
-		"Referer": "https://www.sec.gov/",
-	}
-
-
-_SEC_SESSION: requests.Session | None = None
-
-
-def _sec_session() -> requests.Session:
-	global _SEC_SESSION
-	if _SEC_SESSION is None:
-		s = requests.Session()
-		retry = Retry(total=3, backoff_factor=0.6, status_forcelist=[429, 500, 502, 503, 504])
-		adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
-		s.mount("https://", adapter)
-		s.mount("http://", adapter)
-		_SEC_SESSION = s
-	return _SEC_SESSION
-
-
-@functools.lru_cache(maxsize=1)
-def _sec_company_tickers() -> Dict[str, Any]:
-	url = "https://www.sec.gov/files/company_tickers.json"
-	resp = _sec_session().get(url, headers=_sec_headers(), timeout=20)
-	resp.raise_for_status()
-	return resp.json() or {}
-
-
-def sec_get_cik_by_ticker(ticker: str) -> str:
-	if not ticker:
-		return ""
-	data = _sec_company_tickers()
-	try:
-		for _, v in (data.items() if isinstance(data, dict) else []):
-			if (v.get("ticker") or "").lower() == ticker.lower():
-				return str(v.get("cik_str") or "").zfill(10)
-	except Exception:
-		pass
-	return ""
-
-
-def sec_get_cik_by_name(name: str) -> str:
-	if not name:
-		return ""
-	data = _sec_company_tickers()
-	try:
-		for _, v in (data.items() if isinstance(data, dict) else []):
-			title = v.get("title") or ""
-			if name.lower() in title.lower():
-				return str(v.get("cik_str") or "").zfill(10)
-	except Exception:
-		pass
-	return ""
-
-
-def sec_get_latest_filing_text(cik: str) -> str:
-	if not cik:
-		return ""
-	subm_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-	logger.info("Fetching SEC submissions for CIK=%s", cik)
-	subm = _sec_session().get(subm_url, headers=_sec_headers(), timeout=20).json()
-	recent = ((subm.get("filings") or {}).get("recent") or {})
-	forms = recent.get("form") or []
-	accessions = recent.get("accessionNumber") or []
-	primaries = recent.get("primaryDocument") or []
-	preferred: List[int] = []
-	for code in ["10-K", "20-F", "40-F", "10-Q", "6-K"]:
-		preferred += [i for i, f in enumerate(forms) if f == code]
-	for i in preferred:
-		if i >= len(accessions) or i >= len(primaries):
-			continue
-		accession = (accessions[i] or "").replace("-", "")
-		primary = (primaries[i] or "").strip()
-		if not accession:
-			continue
-		candidates: List[str] = []
-		if primary and primary.lower().endswith((".htm", ".html", ".txt")):
-			candidates.append(f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary}")
-		# Fallback: probe the directory index.json for an html/txt document
-		index_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/index.json"
-		try:
-			idx = _sec_session().get(index_url, headers=_sec_headers(), timeout=20)
-			if idx.ok:
-				data = idx.json()
-				items = ((data.get("directory") or {}).get("item") or [])
-				for it in items:
-					href = (it.get("href") or "").strip()
-					if href.lower().endswith((".htm", ".html")):
-						candidates.append(f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{href}")
-				for it in items:
-					href = (it.get("href") or "").strip()
-					if href.lower().endswith((".txt",)):
-						candidates.append(f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{href}")
-		except Exception:
-			pass
-		for url in candidates:
-			try:
-				logger.info("Fetching SEC filing %s", url)
-				r = _sec_session().get(url, headers=_sec_headers(), timeout=30)
-				r.raise_for_status()
-				return r.text
-			except Exception:
-				logger.exception("Failed to fetch SEC filing %s", url)
-				continue
-	return ""
-
-
-def _html_to_text(html: str) -> str:
-	soup = BeautifulSoup(html or "", "lxml")
-	for tag in soup(["script", "style", "footer", "nav", "table"]):
-		tag.decompose()
-	text = soup.get_text("\n", strip=True)
-	text = re.sub(r"\n{2,}", "\n", text)
-	text = re.sub(r"[ \t]+", " ", text)
-	return text.strip()
-
-
-def _extract_business_or_mda(text: str) -> str:
-	if not text:
-		return ""
-	# Try Item 1. Business
-	m = re.search(r"(?is)Item\s+1\.?\s*Business(.*?)(Item\s+1A\.?|Item\s+2\.)", text)
-	if m:
-		return (m.group(1) or "").strip()
-	# Try MD&A from 10-Q structure
-	m = re.search(r"(?is)Part\s+I\b.*?Item\s+2\.?\s*Management.*?Discussion.*?Analysis(.*?)(Item\s+3\.|Part\s+II\b)", text)
-	if m:
-		return (m.group(1) or "").strip()
-	# Fallback: leading narrative chunk
-	return text[:8000]
-
-
-def sec_summarize_filing(html: str, openai_api_key: str) -> str:
-	if not html:
-		return ""
-	text = _html_to_text(html)
-	section = _extract_business_or_mda(text)
-	if not section:
-		return ""
-	client = OpenAI(api_key=openai_api_key)
-	system = (
-		"Summarize ONLY the company's business (products/services, customers, end-markets, delivery model, geography). "
-		"Ignore codes of ethics, insider trading policies, governance, compensation, exhibits, and legal boilerplate."
-	)
-	user = "Section text:\n" + section[:12000]
-	try:
-		resp = client.chat.completions.create(
-			model="gpt-4o-mini",
-			messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-		)
-		out = (resp.choices[0].message.content or "").strip()
-		logger.info("SEC summary generated len=%s", len(out))
-		return out
-	except Exception:
-		logger.exception("SEC summary failed, returning truncated section")
-		return section[:1200]
-
-
-def enrich_with_sec(
-	target_name: str,
-	comparables: List[Dict[str, Any]],
-	openai_api_key: str,
-	default_target_description: str,
-) -> Dict[str, Any]:
-	"""Fetch SEC filings for target and peers, summarize to enrich descriptions.
-
-	Returns {"target_description": str, "comparables": List[comp with sec_summary]}.
-	"""
-	# Target
-	target_cik = sec_get_cik_by_name(target_name)
-	target_summary = ""
-	if target_cik:
-		try:
-			filing_text = sec_get_latest_filing_text(target_cik)
-			target_summary = sec_summarize_filing(filing_text, openai_api_key)
-		except Exception:
-			target_summary = ""
-	enriched_target = target_summary or default_target_description
-	# Peers
-	enriched: List[Dict[str, Any]] = []
-	sec_hits = 0
-	for comp in comparables:
-		sec_summary = ""
-		ticker = (comp.get("ticker") or comp.get("symbol") or "").strip()
-		cik = sec_get_cik_by_ticker(ticker) or sec_get_cik_by_name(comp.get("name") or "")
-		if cik:
-			try:
-				filing_text = sec_get_latest_filing_text(cik)
-				sec_summary = sec_summarize_filing(filing_text, openai_api_key)
-				if sec_summary:
-					sec_hits += 1
-			except Exception:
-				sec_summary = ""
-		new_c = dict(comp)
-		if sec_summary:
-			new_c["sec_summary"] = sec_summary
-		enriched.append(new_c)
-	logger.info("SEC enrichment: peers=%s with_summary=%s", len(comparables), sec_hits)
-	return {"target_description": enriched_target, "comparables": enriched}
 
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
 	va = np.array(a)
@@ -723,10 +262,6 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
 
 
 def _comp_similarity_text(comp: Dict[str, Any]) -> str:
-	# Prefer SEC summary if available for richer text
-	sec_summary = (comp.get("sec_summary") or "").strip()
-	if sec_summary:
-		return sec_summary
 	parts = [
 		comp.get("name") or "",
 		comp.get("business_activity") or "",

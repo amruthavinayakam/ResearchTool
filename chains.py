@@ -94,14 +94,16 @@ def _build_queries(name: str, url: str, desc: str, sic: str, signals: Dict[str, 
 def get_llm_clients(openai_key: str) -> tuple[ChatOpenAI, ChatOpenAI]:
 	# Use JSON response format to improve structured outputs
 	llm = ChatOpenAI(
-		model="gpt-4o",
+		model="gpt-5",
 		temperature=0,
+		max_tokens=900,
 		api_key=openai_key,
 		model_kwargs={"response_format": {"type": "json_object"}},
 	)
 	classifier = ChatOpenAI(
-		model="gpt-4o-mini",
+		model="gpt-5",
 		temperature=0,
+		max_tokens=400,
 		api_key=openai_key,
 		model_kwargs={"response_format": {"type": "json_object"}},
 	)
@@ -259,27 +261,107 @@ class ComparableFinder:
 			logger.exception("Signal extraction failed")
 			return {"keywords": [], "industry_groups": [], "products": [], "customer_segments": [], "business_focus": ""}
 
+	def _gpt_search_candidates(self, name: str, sic_name: str, description: str, url: str) -> List[Dict[str, str]]:
+		"""Use GPT-5 to propose peer/competitor candidates in the same SIC industry group.
+
+		Returns lightweight candidates: [{name, url, context, symbol?}].
+		"""
+		cache_key = "gpt_search:" + self._hash_obj({"name": name, "sic": sic_name, "desc": description, "url": url})
+		cached = self._cache_get(cache_key)
+		if cached is not None:
+			return cached
+		logger.info("GPT search for peers: name=%s sic=%s", name, sic_name)
+		instruction = (
+			"You are a strict research assistant. Find ONLY U.S. publicly traded competitors and peers of the target in the SAME SIC industry "
+			"(use the provided SIC name/code; if code, infer the group name). "
+			"Return 3-10 JSON objects with keys: name, url, context, and optional symbol (ticker). Exchanges allowed: NYSE, NASDAQ, AMEX. "
+			"Exclude private, non-U.S., ADRs, ETFs/funds, suppliers, and customers. Avoid duplicates."
+		)
+		user = (
+			"Target:\n"
+			f"name: {name}\n"
+			f"url: {url}\n"
+			f"sic: {sic_name}\n"
+			f"description: {description}\n\n"
+			"Return JSON like {{\"candidates\": [{{\"name\":\"...\",\"url\":\"https://...\",\"context\":\"short reason\",\"symbol\":\"TICK\"}}]}}"
+		)
+		prompt = ChatPromptTemplate.from_messages([("system", instruction), ("user", user)])
+		chain = prompt | self.llm
+		try:
+			resp = chain.invoke({})
+			text = resp.content if hasattr(resp, "content") else str(resp)
+			data = json.loads((text or "{}").strip())
+			items = data.get("candidates") or []
+			result: List[Dict[str, str]] = []
+			for it in items:
+				if not isinstance(it, dict):
+					continue
+				nm = (it.get("name") or "").strip()
+				url = (it.get("url") or "").strip()
+				if not nm or not url:
+					continue
+				entry: Dict[str, str] = {"name": nm, "url": url, "context": (it.get("context") or "").strip()}
+				sym = (it.get("symbol") or "").strip()
+				if sym:
+					entry["symbol"] = sym
+				result.append(entry)
+			# bound size
+			if len(result) > MAX_CANDIDATES:
+				result = result[:MAX_CANDIDATES]
+			# cache
+			self._cache_set(cache_key, result)
+			logger.info("GPT search candidates=%s", len(result))
+			return result
+		except Exception:
+			logger.exception("GPT-5 SIC-based search failed")
+			return []
+
 	def _resolve_symbol(self, name: str, url: str) -> str:
+		logger.info("Resolve symbol start: name=%s url=%s", name, url)
 		# Try search by company name first
 		try:
 			res = self._fh_get("/search", {"q": name})
-			for item in (res.get("result") or []):
+			results = (res.get("result") or []) if isinstance(res, dict) else []
+			logger.info("Finnhub search by name: query=%s candidates=%s", name, len(results))
+			if results:
+				preview = []
+				for item in results[:5]:
+					sym = (item.get("symbol") or "").strip()
+					desc = (item.get("description") or item.get("displaySymbol") or "").strip()
+					if sym or desc:
+						preview.append(f"{sym}|{desc}")
+				if preview:
+					logger.info("Name search preview (top5): %s", "; ".join(preview)[:500])
+			for idx, item in enumerate(results):
 				if item.get("symbol"):
-					logger.info("Resolved symbol by name: %s -> %s", name, item.get("symbol"))
+					logger.info("Resolved symbol by name at idx=%s: %s -> %s", idx, name, item.get("symbol"))
 					return item["symbol"]
+			logger.info("No symbol found in search-by-name results for %s", name)
 		except Exception:
-			pass
+			logger.exception("Finnhub search by name failed for %s", name)
 		# Fallback: try domain tokens
 		domain = re.sub(r"^https?://", "", url).split("/")[0] if url else ""
 		if domain:
 			try:
 				res = self._fh_get("/search", {"q": domain})
-				for item in (res.get("result") or []):
+				results = (res.get("result") or []) if isinstance(res, dict) else []
+				logger.info("Finnhub search by domain: query=%s candidates=%s", domain, len(results))
+				if results:
+					preview = []
+					for item in results[:5]:
+						sym = (item.get("symbol") or "").strip()
+						desc = (item.get("description") or item.get("displaySymbol") or "").strip()
+						if sym or desc:
+							preview.append(f"{sym}|{desc}")
+					if preview:
+						logger.info("Domain search preview (top5): %s", "; ".join(preview)[:500])
+				for idx, item in enumerate(results):
 					if item.get("symbol"):
-						logger.info("Resolved symbol by domain: %s -> %s", domain, item.get("symbol"))
+						logger.info("Resolved symbol by domain at idx=%s: %s -> %s", idx, domain, item.get("symbol"))
 						return item["symbol"]
+				logger.info("No symbol found in search-by-domain results for %s", domain)
 			except Exception:
-				pass
+				logger.exception("Finnhub search by domain failed for %s", domain)
 		logger.warning("Failed to resolve symbol for %s (%s)", name, url)
 		return ""
 
@@ -375,15 +457,21 @@ class ComparableFinder:
 		# Guard: nothing to classify
 		if not candidates:
 			return []
-		cache_key = "classify:" + self._hash_obj({"target": {"name": target.get("name"), "desc": target.get("business_description")}, "cands": candidates})
+		# Extract signals (cached) to build stronger guardrails
+		signals = self._extract_signals(target.get("business_description") or "")
+		cache_key = "classify:" + self._hash_obj({"target": {"name": target.get("name"), "desc": target.get("business_description"), "url": target.get("url"), "sic": target.get("sic")}, "cands": candidates})
 		cached = self._cache_get(cache_key)
 		if cached is not None:
 			return cached
 		logger.info("Classifying %s candidates for target=%s", len(candidates), target.get("name"))
 		instruction = (
-			"You are a strict classifier. From the provided candidate companies, select only those that are publicly traded "
-			"and clearly relevant (similar products/services and customer segments) to the target company. "
-			"Return JSON with key 'accepted' as a list of objects with keys: name, url, reason."
+			"You are a strict classifier. Select ONLY candidates that are publicly traded U.S. companies (NYSE, NASDAQ, AMEX) and are direct peers/competitors "
+			"with similar products/services and customer segments, operating in the SAME SIC industry group as the target. "
+			"Leverage the target's name, URL domain and brief description to judge fit. "
+			"REJECT: private, non-U.S., ADRs, ETFs/funds, holding companies with no operations, suppliers, distributors, customers, consultants to the target, "
+			"and entities whose primary business model is orthogonal to the target. "
+			"If confidence is low, do not accept. "
+			"Return STRICT JSON with key 'accepted' as a list of 3-12 objects, each with keys: name, url, reason."
 		)
 		prompt = ChatPromptTemplate.from_messages(
 			[
@@ -393,10 +481,12 @@ class ComparableFinder:
 					(
 						"Target company summary:\n"
 						"name: {target_name}\n"
-						"description: {target_description}\n\n"
+						"url: {target_url}\n"
+						"description: {target_description}\n"
+						"sic: {target_sic}\n\n"
 						"Candidates (name, url, snippet):\n{candidates_json}\n\n"
 						"Return JSON with only the key 'accepted'. Example (keys quoted): "
-						"{\"accepted\": [{\"name\": \"Company A\", \"url\": \"https://example.com\", \"reason\": \"why similar\"}]}"
+						"{{\"accepted\": [{{\"name\": \"Company A\", \"url\": \"https://example.com\", \"reason\": \"why similar\"}}]}}"
 					),
 				),
 			]
@@ -407,6 +497,8 @@ class ComparableFinder:
 				{
 					"target_name": target["name"],
 					"target_description": target["business_description"],
+					"target_sic": target.get("sic", ""),
+					"target_url": target.get("url", ""),
 					"candidates_json": json.dumps(candidates, ensure_ascii=False),
 				}
 			)
@@ -414,6 +506,23 @@ class ComparableFinder:
 			data = json.loads((text or "{}").strip())
 			accepted = data.get("accepted") or []
 			logger.info("Classifier accepted=%s", len(accepted))
+			# If too few accepted, escalate to stronger model for accuracy
+			if len(accepted) < 3:
+				logger.info("Classifier escalation: using main LLM due to low accepted count")
+				chain2 = prompt | self.llm
+				resp2 = chain2.invoke(
+					{
+						"target_name": target["name"],
+						"target_description": target["business_description"],
+						"target_sic": target.get("sic", ""),
+						"target_url": target.get("url", ""),
+						"candidates_json": json.dumps(candidates, ensure_ascii=False),
+					}
+				)
+				text2 = resp2.content if hasattr(resp2, "content") else str(resp2)
+				data2 = json.loads((text2 or "{}").strip())
+				accepted = data2.get("accepted") or accepted
+				logger.info("Classifier escalation accepted=%s", len(accepted))
 			# Build lookup to preserve symbol/context
 			def _keyify(x: Dict[str, str]) -> str:
 				return ((x.get("name") or "").strip().lower() + "|" + (x.get("url") or "").strip().lower())
@@ -425,6 +534,9 @@ class ComparableFinder:
 				url = (item.get("url") or "").strip()
 				if not (name and url):
 					continue
+				# drop self or near-duplicates of target
+				if name.lower() == (target.get("name") or "").strip().lower():
+					continue
 				base = {"name": name, "url": url}
 				orig = orig_map.get((name.strip().lower() + "|" + url.strip().lower()))
 				if orig and orig.get("symbol"):
@@ -432,6 +544,45 @@ class ComparableFinder:
 				if orig and orig.get("context"):
 					base["context"] = orig.get("context")
 				filtered.append(base)
+			# Programmatic guardrail: drop clearly irrelevant by token overlap with target name/description/SIC and domains
+			def _tokset(s: str) -> set[str]:
+				return {t.lower() for t in (s or "").split() if t.isalpha() or t.isalnum()}
+			def _domain_tokens(u: str) -> set[str]:
+				try:
+					from urllib.parse import urlparse as _p
+					host = _p(u or "").netloc or ""
+					parts = [p for p in host.split(".") if p]
+					stop = {"www", "com", "net", "org", "io", "inc", "corp", "co", "ltd"}
+					return {p.lower() for p in parts if p.lower() not in stop}
+				except Exception:
+					return set()
+			target_tokens = _tokset((target.get("business_description") or "") + " " + (target.get("sic") or ""))
+			target_tokens |= _tokset(target.get("name") or "")
+			target_tokens |= _domain_tokens(target.get("url") or "")
+			# include signal-derived keywords/industry terms
+			try:
+				signal_terms = []
+				for lst in [signals.get("keywords") or [], signals.get("industry_groups") or []]:
+					for item in lst:
+						signal_terms += [w for w in str(item).split() if w]
+				target_tokens |= {w.lower() for w in signal_terms}
+			except Exception:
+				pass
+			if filtered and target_tokens:
+				refined: List[Dict[str, str]] = []
+				for cand in filtered:
+					orig = orig_map.get(_keyify(cand)) or {}
+					ctx = (orig.get("context") or "")
+					cand_tokens = _tokset(cand.get("name") or "") | _tokset(ctx) | _domain_tokens(cand.get("url") or "")
+					overlap = len(target_tokens & cand_tokens)
+					if overlap >= 4:
+						refined.append(cand)
+				# only apply if we still have a reasonable set
+				if len(refined) >= 3:
+					filtered = refined
+			# Bound size
+			if len(filtered) > 15:
+				filtered = filtered[:15]
 			self._cache_set(cache_key, filtered)
 			return filtered
 		except Exception:
@@ -459,13 +610,19 @@ class ComparableFinder:
 		target_description: str,
 		target_sic: str = "",
 	) -> Dict[str, Any]:
-		# Gather peers first (signals not required for Finnhub fetch)
-		candidates = self._gather_candidates(
-			name=target_name, url=target_url, desc=target_description, sic=target_sic, signals={}
-		)
-		# Take top N candidates (no similarity ranking)
-		top_candidates = candidates[:TOP_CANDIDATES_FOR_LLM]
-		logger.info("Gathered candidates total=%s top_for_llm=%s", len(candidates), len(top_candidates))
+		# Gather peers from Finnhub and GPT-5 in parallel to reduce latency
+		with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+			fh_future = ex.submit(self._gather_candidates, target_name, target_url, target_description, target_sic, {})
+			gpt_future = ex.submit(self._gpt_search_candidates, target_name, target_sic, target_description, target_url)
+			fh_candidates = fh_future.result() or []
+			gpt_candidates = gpt_future.result() or []
+		# Combine and dedupe by normalized name
+		combined = (fh_candidates or []) + (gpt_candidates or [])
+		combined = unique_by_key(combined, key_fn=lambda x: re.sub(r"[^A-Za-z0-9]", "", (x.get("name") or "")).lower())
+		# Cap for downstream LLM
+		top_candidates = combined[:TOP_CANDIDATES_FOR_LLM]
+		logger.info("Candidates: finnhub=%s gpt=%s combined=%s top_for_llm=%s",
+		            len(fh_candidates or []), len(gpt_candidates or []), len(combined), len(top_candidates))
 
 		# Tier 1: run classifier and signals in parallel to overlap LLM latencies
 		target = {

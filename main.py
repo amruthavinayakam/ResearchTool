@@ -14,14 +14,10 @@ logger = logging.getLogger(__name__)
 from chains import ComparableFinder, get_llm_clients
 from validation import (
 	validate_and_normalize_output,
-	ground_ticker_exchange,
 	add_reasoning_notes,
  	compute_similarity_scores,
  	enrich_similarity_scores,
  	normalize_similarity_scores,
-	enrich_with_sec,
-	filter_us_sec_registrants,
-	filter_us_active_listed,
 )
 
 
@@ -34,7 +30,6 @@ def init_sidebar_keys() -> Dict[str, str]:
 		# Prefer environment variables if available
 		env_openai = os.getenv("OPENAI_API_KEY") or ""
 		env_finnhub = os.getenv("FINNHUB_API_KEY") or ""
-		env_av = os.getenv("ALPHAVANTAGE_API_KEY") or ""
 		if env_openai:
 			openai_api_key = env_openai
 			st.caption("Using OPENAI_API_KEY from environment.")
@@ -45,13 +40,8 @@ def init_sidebar_keys() -> Dict[str, str]:
 			st.caption("Using FINNHUB_API_KEY from environment.")
 		else:
 			finnhub_api_key = st.text_input("Finnhub API Key", type="password", key="finnhub_api_key")
-		if env_av:
-			alphavantage_api_key = env_av
-			st.caption("Using ALPHAVANTAGE_API_KEY from environment.")
-		else:
-			alphavantage_api_key = st.text_input("Alpha Vantage API Key", type="password", key="alphavantage_api_key")
 		st.caption("Keys are kept only in this session state.")
-		return {"openai_api_key": openai_api_key, "finnhub_api_key": finnhub_api_key, "alphavantage_api_key": alphavantage_api_key}
+		return {"openai_api_key": openai_api_key, "finnhub_api_key": finnhub_api_key}
 
 
 def main() -> None:
@@ -142,30 +132,12 @@ def main() -> None:
 	try:
 		# Ground tickers/exchanges first (cheap verification)
 		T0 = time.time()
-		grounded = ground_ticker_exchange(validated["comparables"]) if isinstance(validated, dict) else {"comparables": validated}
-		st.write("Stage: ground_ticker_exchange", round(time.time() - T0, 2)); T0 = time.time()
-		logger.info("Grounding completed; items=%s", len(grounded.get("comparables", [])))
-		# Enforce US SEC registrants only
-		us_only = filter_us_sec_registrants(grounded["comparables"]) if isinstance(grounded, dict) else {"comparables": grounded}
-		st.write("Stage: filter_us_sec_registrants", round(time.time() - T0, 2)); T0 = time.time()
-		if not us_only.get("comparables"):
-			st.error("No U.S. SEC-registered public companies found among results.")
-			st.stop()
-		# Enforce active U.S. listings via Alpha Vantage
-		av_key = keys.get("alphavantage_api_key") or ""
-		active_us = filter_us_active_listed(
-			comparables=us_only["comparables"],
-			alpha_vantage_api_key=av_key,
-			allowed_exchanges=["NYSE", "NASDAQ", "AMEX"],
-		)
-		st.write("Stage: filter_us_active_listed (Alpha Vantage)", round(time.time() - T0, 2)); T0 = time.time()
-		if not active_us.get("comparables"):
-			st.error("No active U.S. listed companies found (Alpha Vantage).")
-			st.stop()
+		base_set = validated if isinstance(validated, dict) else {"comparables": validated}
+		logger.info("Proceeding without SEC/Alpha Vantage filters; items=%s", len(base_set.get("comparables", [])))
 		# Compute baseline similarity BEFORE SEC enrichment (fast path)
 		scored0 = compute_similarity_scores(
 			target_description=target["business_description"],
-			comparables=active_us["comparables"],
+			comparables=base_set["comparables"],
 			openai_api_key=keys["openai_api_key"],
 		)
 		st.write("Stage: compute_similarity_scores", round(time.time() - T0, 2)); T0 = time.time()
@@ -181,37 +153,11 @@ def main() -> None:
 		ordered = sorted(scored0["comparables"], key=lambda c: c.get("similarity_score", 0.0), reverse=True)
 		st.write("Stage: sort_by_similarity", round(time.time() - T0, 2)); T0 = time.time()
 		logger.info("Ranking completed; items=%s", len(ordered))
-		# Enrich only top-k with SEC (expensive); keep k small for responsiveness
-		top_k = min(6, len(ordered))
-		top_for_sec = ordered[:top_k]
-		sec_enriched = enrich_with_sec(
-			target_name=target["name"],
-			comparables=top_for_sec,
-			openai_api_key=keys["openai_api_key"],
-			default_target_description=target["business_description"],
-		)
-		st.write("Stage: enrich_with_sec(top_k)", round(time.time() - T0, 2)); T0 = time.time()
-		logger.info("SEC enrichment completed; enriched_top=%s", len(sec_enriched.get("comparables", [])))
-		# Merge SEC summaries back into top_k while preserving scores
-		enriched_map = { (c.get("name") or "") + "|" + (c.get("ticker") or ""): c for c in sec_enriched["comparables"] }
-		def _key(c: Dict[str, Any]) -> str:
-			return (c.get("name") or "") + "|" + (c.get("ticker") or "")
-		merged: List[Dict[str, Any]] = []
-		for c in ordered:
-			if _key(c) in enriched_map:
-				m = dict(c)
-				sec_c = enriched_map[_key(c)]
-				if sec_c.get("sec_summary"):
-					m["sec_summary"] = sec_c["sec_summary"]
-				merged.append(m)
-			else:
-				merged.append(c)
-		st.write("Stage: merge_sec_summaries", round(time.time() - T0, 2)); T0 = time.time()
-		# Add explainability notes
+		# Add explainability notes on ordered list
 		ranked = add_reasoning_notes(
-			target_description=sec_enriched["target_description"] or target["business_description"],
+			target_description=target["business_description"],
 			target_name=target["name"],
-			comparables=merged,
+			comparables=ordered,
 		)
 		st.write("Stage: add_reasoning_notes", round(time.time() - T0, 2))
 	except Exception as e:
