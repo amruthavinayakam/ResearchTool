@@ -16,6 +16,7 @@ from validation import (
 	map_sic_with_llm,
 	filter_companies_with_llm,
 	enrich_company_details_with_llm,
+	fetch_serp_peers,
 )
 
 
@@ -26,14 +27,21 @@ def init_sidebar_keys() -> Dict[str, str]:
 	with st.sidebar:
 		st.header("API Keys")
 		env_openai = os.getenv("OPENAI_API_KEY") or ""
+		env_serp = os.getenv("SERPAPI_API_KEY") or ""
 		if env_openai:
 			st.caption("Using OPENAI_API_KEY from environment.")
 			openai_api_key = env_openai
 		else:
 			openai_api_key = st.text_input("OpenAI API Key", type="password", key="openai_api_key")
-		st.caption("Key is used to map SIC descriptions via OpenAI.")
+		if env_serp:
+			st.caption("Using SERPAPI_API_KEY from environment.")
+			serp_api_key = env_serp
+		else:
+			serp_api_key = st.text_input("SerpAPI Key (optional)", type="password", key="serpapi_api_key")
+		st.caption("Keys are optional but enable SIC mapping (OpenAI) and external peer discovery (SerpAPI).")
 		return {
 			"openai_api_key": openai_api_key,
+			"serpapi_api_key": serp_api_key,
 		}
 
 
@@ -80,6 +88,7 @@ def main() -> None:
 		st.error("OpenAI API Key is required to map SIC descriptions.")
 		st.stop()
 	openai_key = keys.get("openai_api_key") or ""
+	serp_key = keys.get("serpapi_api_key") or ""
 
 	with st.spinner("Resolving SIC and fetching companies from SEC..."):
 		try:
@@ -163,23 +172,56 @@ def main() -> None:
 				seen.add(key)
 				unique_companies.append(entry)
 			logger.info("main: aggregated %s unique companies across %s SIC codes", len(unique_companies), len(resolved_matches))
+			serp_candidates = []
+			if serp_key and company_name:
+				try:
+					serp_candidates = fetch_serp_peers(
+						target_name=company_name,
+						serp_api_key=serp_key,
+						max_results=10,
+					)
+				except Exception as exc:
+					logger.exception("SerpAPI peer discovery failed: %s", exc)
+					st.warning("SerpAPI lookup failed; continuing with SEC results only.")
 			# Map to required comparable fields
 			comparables = []
+			used_keys = set()
 			for c in unique_companies:
 				sic_label = c.get("_sic_name") or "-"
 				if sic_label and sic_label != "-":
 					sic_display = f"{c.get('_sic_code')} — {sic_label}"
 				else:
 					sic_display = c.get("_sic_code") or "unknown"
+				entry = {
+					"name": c.get("name") or "",
+					"url": c.get("url") or "",
+					"exchange": c.get("exchange") or "unknown",
+					"ticker": c.get("ticker") or "unknown",
+					"business_activity": "unknown",
+					"customer_segment": "unknown",
+					"SIC_industry": sic_display,
+				}
+				key = ((entry["name"] or "").lower(), entry["url"])
+				if key[0] or key[1]:
+					used_keys.add(key)
+				comparables.append(entry)
+			for serp in serp_candidates:
+				name = (serp.get("name") or "").strip()
+				url = (serp.get("url") or "").strip()
+				key = (name.lower(), url)
+				if key in used_keys:
+					continue
+				if key[0] or key[1]:
+					used_keys.add(key)
 				comparables.append(
 					{
-						"name": c.get("name") or "",
-						"url": c.get("url") or "",
-						"exchange": c.get("exchange") or "unknown",
-						"ticker": c.get("ticker") or "unknown",
+						"name": name or (serp.get("title") or url),
+						"url": url,
+						"exchange": "unknown",
+						"ticker": "unknown",
 						"business_activity": "unknown",
-						"customer_segment": "unknown",
-						"SIC_industry": sic_display,
+						"customer_segment": serp.get("snippet") or "unknown",
+						"SIC_industry": "SERP peer result",
 					}
 				)
 			filtered_comparables = comparables

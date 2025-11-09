@@ -535,3 +535,64 @@ def map_sic_with_llm(user_input: str, openai_api_key: str) -> Dict[str, Any]:
 	logger.info("map_sic_with_llm: LLM mapped '%s' -> %s", user_input, cleaned)
 	return {"matches": cleaned}
 
+
+def fetch_serp_peers(
+	target_name: str,
+	serp_api_key: str,
+	max_results: int = 10,
+) -> List[Dict[str, str]]:
+	"""Use SerpAPI (Google engine) to fetch publicly traded peers/competitors."""
+	name = (target_name or "").strip()
+	if not name or not serp_api_key:
+		return []
+
+	queries = [
+		f"{name} publicly traded competitors",
+		f"{name} publicly traded peers",
+	]
+	results: List[Dict[str, str]] = []
+	seen_links: set[str] = set()
+	for query in queries:
+		params = {
+			"engine": "google",
+			"q": query,
+			"api_key": serp_api_key,
+			"num": max_results,
+		}
+		try:
+			resp = requests.get("https://serpapi.com/search", params=params, timeout=25)
+			resp.raise_for_status()
+			payload = resp.json()
+		except Exception:
+			logger.exception("SerpAPI request failed for query '%s'", query)
+			continue
+		organic = payload.get("organic_results")
+		if not isinstance(organic, list):
+			continue
+		for item in organic:
+			if not isinstance(item, dict):
+				continue
+			link = (item.get("link") or "").strip()
+			title = (item.get("title") or "").strip()
+			if not link or link in seen_links:
+				continue
+			seen_links.add(link)
+			display = title
+			if " - " in title:
+				display = title.split(" - ", 1)[0].strip()
+			elif "|" in title:
+				display = title.split("|", 1)[0].strip()
+			if not display:
+				display = title or link
+			results.append(
+				{
+					"name": display,
+					"url": link,
+					"query": query,
+					"title": title,
+					"snippet": item.get("snippet") or "",
+				}
+			)
+	logger.info("SerpAPI peers fetched %s results for target '%s'", len(results), name)
+	return results
+
