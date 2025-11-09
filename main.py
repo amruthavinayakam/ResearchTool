@@ -10,7 +10,13 @@ if not logging.getLogger().handlers:
 	logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-from validation import fetch_companies_by_sic, fetch_sic_index, map_sic_with_llm, filter_companies_with_llm
+from validation import (
+	fetch_companies_by_sic,
+	fetch_sic_index,
+	map_sic_with_llm,
+	filter_companies_with_llm,
+	enrich_company_details_with_llm,
+)
 
 
 st.set_page_config(page_title="Comparable Companies Finder", page_icon="📈", layout="wide")
@@ -34,7 +40,7 @@ def init_sidebar_keys() -> Dict[str, str]:
 def main() -> None:
 	st.title("Comparable Public Companies Generator")
 	st.write(
-		"Provide target company details. The app will use SerpAPI and OpenAI to propose comparable publicly traded companies."
+		"Provide target company details. The app will use OpenAI to propose comparable publicly traded companies."
 	)
 
 	keys = init_sidebar_keys()
@@ -45,14 +51,14 @@ def main() -> None:
 			company_name = st.text_input("Company Name", placeholder="Acme Corp")
 			homepage_url = st.text_input("Homepage URL", placeholder="https://www.acme.com")
 		with col2:
-			sic = st.text_input("Primary SIC Industry Classification", placeholder="7372")
+			sic = st.text_input("Primary SIC Industry Classification", placeholder="Research and Consulting Services")
 			business_desc = st.text_area(
 				"Brief Business Description",
 				placeholder="Describe core products/services and customers",
 				height=120,
 			)
 
-		submit = st.form_submit_button("Find Comparables 🚀")
+		submit = st.form_submit_button("Find Publically Traded Comparables")
 
 	if not submit:
 		st.stop()
@@ -78,41 +84,93 @@ def main() -> None:
 	with st.spinner("Resolving SIC and fetching companies from SEC..."):
 		try:
 			# Resolve SIC (code or best matching name)
-			code = ""
-			sic_name = "-"
-			if re.fullmatch(r"\s*\d{4}\s*", sic or ""):
-				code = (sic or "").strip()
-				# Map code->name from SEC list (no hardcoding)
+			resolved_matches: List[Dict[str, Any]] = []
+			sic_list = [part.strip() for part in (sic or "").split(",") if part.strip()]
+			numeric_matches = [code for code in sic_list if re.fullmatch(r"\d{4}", code)]
+			if numeric_matches:
 				try:
 					entries = fetch_sic_index()
-					for e in entries:
-						if e.get("code") == code:
-							sic_name = e.get("name") or "-"
-							break
+					name_lookup = {entry.get("code"): entry.get("name") for entry in entries}
 				except Exception:
-					sic_name = "-"
-				st.success(f"Resolved SIC: {code} — {sic_name}")
+					name_lookup = {}
+				for idx, code in enumerate(numeric_matches[:2]):
+					resolved_matches.append(
+						{
+							"sic_code": code,
+							"sic_name": name_lookup.get(code) or "-",
+							"confidence": 1.0 if idx == 0 else None,
+						}
+					)
+				st.success(
+					"Resolved SIC (manual): "
+					+ ", ".join(
+						f"{match['sic_code']} — {match.get('sic_name') or '-'}"
+						for match in resolved_matches
+					)
+				)
 			else:
 				llm_res = map_sic_with_llm(user_input=sic, openai_api_key=openai_key)
-				code = (llm_res.get("sic_code") or "").strip()
-				sic_name = llm_res.get("sic_name") or "-"
-				conf = llm_res.get("confidence")
-				st.success(f"Resolved SIC (LLM): {code} — {sic_name} (confidence={conf})")
-			# Fetch companies for resolved SIC
-			logger.info("main: fetching companies for SIC=%s", code)
-			companies = fetch_companies_by_sic(
-				sic_code=code,
-				start=0,
-				count=40,
-				owner="include",
-			)
-			if not companies:
-				st.warning("No companies found for this SIC on SEC browse-EDGAR.")
+				matches = llm_res.get("matches") or []
+				if not matches:
+					raise ValueError("LLM did not return any SIC matches.")
+				resolved_matches = matches[:2]
+				st.success(
+					"Resolved SIC (LLM): "
+					+ ", ".join(
+						f"{match.get('sic_code')} — {match.get('sic_name') or '-'}"
+						for match in resolved_matches
+					)
+				)
+			if not resolved_matches:
+				st.error("Unable to resolve any SIC codes.")
 				st.stop()
-			logger.info("main: fetched %s companies for SIC %s", len(companies), code)
+			# Fetch companies for each resolved SIC
+			all_companies: List[Dict[str, Any]] = []
+			for order, match in enumerate(resolved_matches):
+				code = (match.get("sic_code") or "").strip()
+				if not code:
+					continue
+				logger.info("main: fetching companies for SIC=%s (order=%s)", code, order)
+				companies = fetch_companies_by_sic(
+					sic_code=code,
+					start=0,
+					count=40,
+					owner="include",
+				)
+				if not companies:
+					logger.info("main: no companies found for SIC=%s", code)
+					continue
+				for entry in companies:
+					entry = dict(entry)
+					entry["_sic_code"] = code
+					entry["_sic_name"] = match.get("sic_name") or "-"
+					entry["_sic_order"] = order
+					all_companies.append(entry)
+			if not all_companies:
+				st.warning("No companies found for the resolved SIC codes on SEC browse-EDGAR.")
+				st.stop()
+			# Deduplicate by CIK/ticker while preserving order (primary code first)
+			unique_companies: List[Dict[str, Any]] = []
+			seen = set()
+			for entry in all_companies:
+				key = (entry.get("cik") or "").strip()
+				if not key:
+					key = f"{(entry.get('ticker') or '').upper()}::{(entry.get('exchange') or '').upper()}"
+				if not key:
+					key = (entry.get("name") or "").strip().lower()
+				if key in seen:
+					continue
+				seen.add(key)
+				unique_companies.append(entry)
+			logger.info("main: aggregated %s unique companies across %s SIC codes", len(unique_companies), len(resolved_matches))
 			# Map to required comparable fields
 			comparables = []
-			for c in companies:
+			for c in unique_companies:
+				sic_label = c.get("_sic_name") or "-"
+				if sic_label and sic_label != "-":
+					sic_display = f"{c.get('_sic_code')} — {sic_label}"
+				else:
+					sic_display = c.get("_sic_code") or "unknown"
 				comparables.append(
 					{
 						"name": c.get("name") or "",
@@ -121,7 +179,7 @@ def main() -> None:
 						"ticker": c.get("ticker") or "unknown",
 						"business_activity": "unknown",
 						"customer_segment": "unknown",
-						"SIC_industry": sic_name,
+						"SIC_industry": sic_display,
 					}
 				)
 			filtered_comparables = comparables
@@ -140,12 +198,23 @@ def main() -> None:
 				except Exception as exc:
 					logger.exception("LLM filtering failed: %s", exc)
 					st.warning("LLM filtering failed; showing unfiltered results.")
+				try:
+					filtered_comparables = enrich_company_details_with_llm(
+						target_name=company_name,
+						target_description=business_desc,
+						comparables=filtered_comparables,
+						openai_api_key=openai_key,
+					)
+				except Exception as exc:
+					logger.exception("LLM enrichment failed: %s", exc)
+					st.warning("LLM enrichment failed; some fields may remain 'unknown'.")
 			else:
 				st.info("Provide an OpenAI API key to enable LLM-based relevance filtering.")
 			if not filtered_comparables:
 				st.warning("No comparable companies remain after filtering.")
 				st.stop()
-			st.subheader(f"Comparable Companies (SEC, SIC {code})")
+			sic_codes_display = ", ".join(match.get("sic_code") for match in resolved_matches if match.get("sic_code"))
+			st.subheader(f"Comparable Companies (SEC, SIC {sic_codes_display})")
 			import pandas as pd
 			df = pd.DataFrame(filtered_comparables, columns=["name","url","exchange","ticker","business_activity","customer_segment","SIC_industry"])
 			st.dataframe(df, use_container_width=True)
