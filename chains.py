@@ -6,16 +6,11 @@ import re
 import concurrent.futures
 from typing import Any, Dict, List, Tuple
 
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from typing import Optional
 import streamlit as st
 import hashlib
-import requests_cache
-from diskcache import Cache
 import logging
+from diskcache import Cache
 
 from utils import (
 	retry_with_exponential_backoff,
@@ -24,13 +19,9 @@ from utils import (
 )
 
 
-MAX_CANDIDATES = 60
-TOP_CANDIDATES_FOR_LLM = 40
+MAX_CANDIDATES = 500
+TOP_CANDIDATES_FOR_LLM = 100
 CACHE_EXPIRE_SECONDS = 86400
-
-# Install transparent HTTP cache (covers requests + Session)
-requests_cache.install_cache("finnhub_cache", expire_after=CACHE_EXPIRE_SECONDS)
-logging.getLogger(__name__).info("requests-cache enabled (finnhub_cache, ttl=%s)", CACHE_EXPIRE_SECONDS)
 logger = logging.getLogger(__name__)
 
 
@@ -91,23 +82,10 @@ def _build_queries(name: str, url: str, desc: str, sic: str, signals: Dict[str, 
 
 
 @st.cache_resource
-def get_llm_clients(openai_key: str) -> tuple[ChatOpenAI, ChatOpenAI]:
-	# Use JSON response format to improve structured outputs
-	llm = ChatOpenAI(
-		model="gpt-5",
-		temperature=0,
-		max_tokens=900,
-		api_key=openai_key,
-		model_kwargs={"response_format": {"type": "json_object"}},
-	)
-	classifier = ChatOpenAI(
-		model="gpt-5",
-		temperature=0,
-		max_tokens=400,
-		api_key=openai_key,
-		model_kwargs={"response_format": {"type": "json_object"}},
-	)
-	return llm, classifier
+def get_llm_clients(openai_key: str) -> tuple[Optional[None], Optional[None]]:
+	# LLM clients removed; return placeholders for compatibility
+	logging.getLogger(__name__).info("LLM clients disabled for company discovery")
+	return None, None
 
 
 class ComparableFinder:
@@ -115,19 +93,7 @@ class ComparableFinder:
 		self.openai_api_key = openai_api_key
 		self.serpapi_api_key = serpapi_api_key or ""
 		self.finnhub_api_key = finnhub_api_key or ""
-		# HTTP session with connection pooling and basic retries
-		self.http = requests.Session()
-		retry = Retry(total=2, backoff_factor=0.3, status_forcelist=[429, 500, 502, 503, 504])
-		adapter = HTTPAdapter(max_retries=retry, pool_connections=16, pool_maxsize=16)
-		self.http.mount("https://", adapter)
-		self.http.mount("http://", adapter)
-		# Disk cache for LLM outputs
-		self.llm_cache = get_llm_disk_cache()
-		# Cached LLM clients
-		llm, classifier = get_llm_clients(openai_api_key)
-		self.llm = llm
-		self.classifier_llm = classifier
-		logger.info("ComparableFinder init: finnhub_key=%s, openai_key=%s", bool(self.finnhub_api_key), bool(self.openai_api_key))
+		logger.info("ComparableFinder initialized (external discovery disabled)")
 
 	def _hash_obj(self, obj: Any) -> str:
 		try:
@@ -152,18 +118,17 @@ class ComparableFinder:
 				url = (item.get("url") or "").strip() or "unknown"
 				if not name:
 					continue
-				clean: Dict[str, Any] = {
-					"name": name,
-					"url": url or "unknown",
-					"exchange": (item.get("exchange") or "unknown").strip() or "unknown",
-					"ticker": (item.get("ticker") or "unknown").strip() or "unknown",
-					"business_activity": (item.get("business_activity") or "unknown").strip() or "unknown",
-					"customer_segment": (item.get("customer_segment") or "unknown").strip() or "unknown",
-					"SIC_industry": (item.get("SIC_industry") or "unknown").strip() or "unknown",
-				}
-				# Keep only if all required keys present and non-empty
-				if all((isinstance(clean[k], str) and clean[k].strip()) for k in required):
-					result.append(clean)
+				# Fill missing fields with 'unknown' to avoid dropping otherwise good entries
+				clean: Dict[str, Any] = {}
+				clean["name"] = name
+				clean["url"] = url or "unknown"
+				clean["exchange"] = (item.get("exchange") or "unknown").strip() or "unknown"
+				# Accept symbol as ticker if ticker missing
+				clean["ticker"] = (item.get("ticker") or item.get("symbol") or "unknown").strip() or "unknown"
+				clean["business_activity"] = (item.get("business_activity") or "unknown").strip() or "unknown"
+				clean["customer_segment"] = (item.get("customer_segment") or "unknown").strip() or "unknown"
+				clean["SIC_industry"] = (item.get("SIC_industry") or item.get("industry") or "unknown").strip() or "unknown"
+				result.append(clean)
 		logger.info("LLM structured count=%s valid=%s", (len(comps) if isinstance(comps, list) else 0), len(result))
 		# If insufficient, synthesize from fallback candidates
 		if len(result) < 3 and isinstance(fallback_candidates, list):
@@ -233,7 +198,7 @@ class ComparableFinder:
 				(
 					"system",
 					(
-						"Extract business signals from the description. Return JSON with keys: "
+						"Extract business signals from the description. Return JSON ONLY with keys: "
 						"keywords (5-12), industry_groups (1-5 names, not codes), products (1-6), customer_segments (1-6), "
 						"business_focus (3-5 words summarizing the domain/industry)."
 					),
@@ -241,7 +206,7 @@ class ComparableFinder:
 				("user", "Description: {text}"),
 			]
 		)
-		chain = prompt | self.llm
+		chain = prompt | self.classifier_llm
 		try:
 			resp = chain.invoke({"text": description})
 			text = resp.content if hasattr(resp, "content") else str(resp)
@@ -266,32 +231,52 @@ class ComparableFinder:
 
 		Returns lightweight candidates: [{name, url, context, symbol?}].
 		"""
-		cache_key = "gpt_search:" + self._hash_obj({"name": name, "sic": sic_name, "desc": description, "url": url})
+		cache_key = "gpt_search:" + self._hash_obj({
+			"version": GPT_SEARCH_CACHE_VERSION,
+			"name": name,
+			"sic": sic_name,
+			"desc": description,
+			"url": url,
+		})
 		cached = self._cache_get(cache_key)
-		if cached is not None:
+		if isinstance(cached, list) and len(cached) > 0:
 			return cached
+		if isinstance(cached, list) and len(cached) == 0:
+			logger.info("Ignoring empty cached GPT candidates (will retry fresh)")
 		logger.info("GPT search for peers: name=%s sic=%s", name, sic_name)
 		instruction = (
-			"You are a strict research assistant. Find ONLY U.S. publicly traded competitors and peers of the target in the SAME SIC industry "
-			"(use the provided SIC name/code; if code, infer the group name). "
-			"Return 3-10 JSON objects with keys: name, url, context, and optional symbol (ticker). Exchanges allowed: NYSE, NASDAQ, AMEX. "
-			"Exclude private, non-U.S., ADRs, ETFs/funds, suppliers, and customers. Avoid duplicates."
+			"Find U.S. publicly traded peers/competitors of the target in the same industry. "
+			"Return JSON ONLY under key \"candidates\" with 5-10 items; each item has: name, url, context (<=16 words), optional symbol. "
+			"Prefer NYSE/NASDAQ/AMEX listings. Avoid private companies, obvious non-peers, and duplicates. No extra text outside JSON."
 		)
 		user = (
 			"Target:\n"
 			f"name: {name}\n"
 			f"url: {url}\n"
 			f"sic: {sic_name}\n"
-			f"description: {description}\n\n"
+			f"description: {description[:400]}\n\n"
 			"Return JSON like {{\"candidates\": [{{\"name\":\"...\",\"url\":\"https://...\",\"context\":\"short reason\",\"symbol\":\"TICK\"}}]}}"
 		)
 		prompt = ChatPromptTemplate.from_messages([("system", instruction), ("user", user)])
-		chain = prompt | self.llm
+		chain = prompt | self.classifier_llm
 		try:
 			resp = chain.invoke({})
-			text = resp.content if hasattr(resp, "content") else str(resp)
-			data = json.loads((text or "{}").strip())
-			items = data.get("candidates") or []
+			raw = resp.content if hasattr(resp, "content") else resp
+			if isinstance(raw, (dict, list)):
+				data = raw
+			else:
+				s = str(raw)
+				try:
+					data = json.loads(clean_json_text(s))
+				except Exception:
+					data = {}
+			# Accept dict with 'candidates' or a bare list
+			if isinstance(data, list):
+				items = data
+			elif isinstance(data, dict):
+				items = data.get("candidates") or data.get("results") or []
+			else:
+				items = []
 			result: List[Dict[str, str]] = []
 			for it in items:
 				if not isinstance(it, dict):
@@ -308,8 +293,9 @@ class ComparableFinder:
 			# bound size
 			if len(result) > MAX_CANDIDATES:
 				result = result[:MAX_CANDIDATES]
-			# cache
-			self._cache_set(cache_key, result)
+			# cache non-empty only
+			if result:
+				self._cache_set(cache_key, result)
 			logger.info("GPT search candidates=%s", len(result))
 			return result
 		except Exception:
@@ -405,44 +391,107 @@ class ComparableFinder:
 		logger.info("Candidate profiles fetched=%s deduped=%s", len(syms), len(candidates))
 		return candidates[:MAX_CANDIDATES]
 
+	def _build_doc_text(self, c: Dict[str, str]) -> str:
+		parts = [
+			c.get("name") or "",
+			c.get("context") or "",
+			c.get("url") or "",
+			c.get("symbol") or "",
+		]
+		return " | ".join([p for p in parts if p])
+
+	def _embed_texts(self, texts: List[str]) -> List[List[float]]:
+		if not texts:
+			return []
+		resp = self._emb_client.embeddings.create(model="text-embedding-3-small", input=texts)
+		return [item.embedding for item in resp.data]
+
+	def _chroma_upsert(self, items: List[Dict[str, str]]) -> None:
+		if not items:
+			return
+		ids: List[str] = []
+		docs: List[str] = []
+		metas: List[Dict[str, Any]] = []
+		for c in items:
+			uid = self._hash_obj({"name": c.get("name"), "url": c.get("url")})
+			ids.append(uid)
+			docs.append(self._build_doc_text(c))
+			metas.append({
+				"name": c.get("name") or "",
+				"url": c.get("url") or "",
+				"context": c.get("context") or "",
+				"symbol": c.get("symbol") or "",
+			})
+		try:
+			embs = self._embed_texts(docs)
+			self.chroma.upsert(ids=ids, documents=docs, metadatas=metas, embeddings=embs)
+			logger.info("Chroma upserted=%s", len(ids))
+		except Exception:
+			logger.exception("Chroma upsert failed")
+
+	def _chroma_query(self, target_text: str, k: int = 30) -> List[Dict[str, str]]:
+		try:
+			qe = self._embed_texts([target_text])[0:1]
+			if not qe:
+				return []
+			res = self.chroma.query(query_embeddings=qe, n_results=min(k, 50))
+			out: List[Dict[str, str]] = []
+			for md in (res.get("metadatas") or [[]])[0]:
+				if not isinstance(md, dict):
+					continue
+				name = (md.get("name") or "").strip()
+				url = (md.get("url") or "").strip()
+				if not name or not url:
+					continue
+				entry: Dict[str, str] = {"name": name, "url": url}
+				if md.get("symbol"):
+					entry["symbol"] = md.get("symbol")
+				if md.get("context"):
+					entry["context"] = md.get("context")
+				out.append(entry)
+			logger.info("Chroma returned=%s", len(out))
+			return out
+		except Exception:
+			logger.exception("Chroma query failed")
+			return []
+
 	def _compose_prompt(self, target: Dict[str, str], candidates: List[Dict[str, str]]) -> ChatPromptTemplate:
 		if candidates:
 			instruction = (
-				"You are given a target company and a list of candidate companies. "
-				"Return a JSON object with key 'comparables' containing 3 to 10 entries. "
+				"You are given a target company and a list of candidate companies. Return JSON ONLY. "
+				"Return a JSON object with key 'comparables' containing 3 to 8 entries. "
 				"Choose ONLY from the provided candidates; do not add companies not present in the candidate list. "
-				"Return ONLY PUBLICLY TRADED U.S. COMPANIES (listed on NYSE, NASDAQ, or AMEX) whose products/services and customer segments are similar to the target. NO PRIVATE OR NON-U.S. COMPANIES. "
+				"Return publicly traded U.S. companies (NYSE, NASDAQ, AMEX preferred) that are peers/competitors with similar products/services and customer segments. "
 				"Use provided snippets and any provided ticker/symbol fields to infer fields. If ticker/exchange cannot be determined confidently, write 'unknown'. "
 				"Fields per comparable (exact keys): name, url, exchange, ticker, business_activity, customer_segment, SIC_industry. "
-				"For SIC_industry, output the SIC industry group name(s), absolutely do NOT include any numeric SIC codes or numbers, "
-				"comma-separated when multiple apply."
+				"For SIC_industry, output the industry group name(s); do NOT include numeric codes; comma-separated when multiple apply. "
+				"No extra text outside JSON."
 			)
 			user_msg = (
 				"Target company:\n"
 				"name: {target_name}\n"
 				"url: {target_url}\n"
-				"business_description: {target_description}\n"
+				"business_description: {target_description_short}\n"
 				"SIC_industry: {target_sic}\n\n"
-				"Candidates (include symbol when available):\n{candidates_json}\n\n"
-				"Return JSON with a single key 'comparables' -> list[3..10] of objects with keys: name, url, exchange, ticker, business_activity, customer_segment, SIC_industry."
+				"Candidates (include symbol when available; short context):\n{candidates_json}\n\n"
+				"Return JSON with a single key 'comparables' -> list[3..8] of objects with keys: name, url, exchange, ticker, business_activity, customer_segment, SIC_industry."
 			)
 		else:
 			instruction = (
-				"You are given a target company. "
-				"Return a JSON object with key 'comparables' containing 3 to 10 entries of PUBLICLY TRADED U.S. COMPANIES (NYSE, NASDAQ, AMEX only). "
-				"Companies must be U.S. registrants (SIC is U.S.-specific). NO PRIVATE OR NON-U.S. COMPANIES. "
+				"You are given a target company. Return JSON ONLY. "
+				"Return a JSON object with key 'comparables' containing 3 to 8 entries of publicly traded U.S. companies (NYSE, NASDAQ, AMEX preferred). "
 				"If ticker/exchange cannot be determined confidently, write 'unknown'. "
 				"Fields per comparable (exact keys): name, url, exchange, ticker, business_activity, customer_segment, SIC_industry. "
-				"For SIC_industry, output the SIC industry group name(s), absolutely do NOT include any numeric SIC codes or numbers."
+				"For SIC_industry, output the industry group name(s); do NOT include numeric codes. No extra text outside JSON."
 			)
 			user_msg = (
 				"Target company:\n"
 				"name: {target_name}\n"
 				"url: {target_url}\n"
-				"business_description: {target_description}\n"
+				"business_description: {target_description_short}\n"
 				"SIC_industry: {target_sic}\n\n"
 				"No candidates were available. Generate comparable public companies directly from the target description.\n"
-				"Return JSON with a single key 'comparables' -> list[3..10] with fields: name, url, exchange, ticker, business_activity, customer_segment, SIC_industry."
+				"Return JSON with a single key 'comparables' -> list[3..8] with fields: name, url, exchange, ticker, business_activity, customer_segment, SIC_industry."
 			)
 		prompt = ChatPromptTemplate.from_messages(
 			[
@@ -464,14 +513,25 @@ class ComparableFinder:
 		if cached is not None:
 			return cached
 		logger.info("Classifying %s candidates for target=%s", len(candidates), target.get("name"))
+		# Prepare lite candidates JSON to reduce prompt length
+		def _tw(txt: str, n: int) -> str:
+			parts = [t for t in (txt or "").split() if t]
+			return " ".join(parts[:n])
+		lite: List[Dict[str, str]] = []
+		for c in candidates:
+			lite.append({
+				"name": (c.get("name") or "").strip(),
+				"url": (c.get("url") or "").strip(),
+				"context": _tw((c.get("context") or c.get("title") or c.get("finnhubIndustry") or ""), 12),
+				"symbol": (c.get("symbol") or "").strip(),
+			})
 		instruction = (
 			"You are a strict classifier. Select ONLY candidates that are publicly traded U.S. companies (NYSE, NASDAQ, AMEX) and are direct peers/competitors "
-			"with similar products/services and customer segments, operating in the SAME SIC industry group as the target. "
+			"with similar products/services and customer segments, operating in the same or closely related industry as the target. "
 			"Leverage the target's name, URL domain and brief description to judge fit. "
 			"REJECT: private, non-U.S., ADRs, ETFs/funds, holding companies with no operations, suppliers, distributors, customers, consultants to the target, "
-			"and entities whose primary business model is orthogonal to the target. "
-			"If confidence is low, do not accept. "
-			"Return STRICT JSON with key 'accepted' as a list of 3-12 objects, each with keys: name, url, reason."
+			"and entities whose primary business model is orthogonal to the target. If confidence is low, do not accept. "
+			"Output STRICT JSON ONLY with key 'accepted' as a list of 3-10 objects with keys: name, url, reason. No explanations outside JSON."
 		)
 		prompt = ChatPromptTemplate.from_messages(
 			[
@@ -482,9 +542,9 @@ class ComparableFinder:
 						"Target company summary:\n"
 						"name: {target_name}\n"
 						"url: {target_url}\n"
-						"description: {target_description}\n"
+						"description: {target_description_short}\n"
 						"sic: {target_sic}\n\n"
-						"Candidates (name, url, snippet):\n{candidates_json}\n\n"
+						"Candidates (name, url, short context):\n{candidates_json}\n\n"
 						"Return JSON with only the key 'accepted'. Example (keys quoted): "
 						"{{\"accepted\": [{{\"name\": \"Company A\", \"url\": \"https://example.com\", \"reason\": \"why similar\"}}]}}"
 					),
@@ -496,15 +556,27 @@ class ComparableFinder:
 			resp = chain.invoke(
 				{
 					"target_name": target["name"],
-					"target_description": target["business_description"],
+					"target_description_short": (target.get("business_description") or "")[:350],
 					"target_sic": target.get("sic", ""),
 					"target_url": target.get("url", ""),
-					"candidates_json": json.dumps(candidates, ensure_ascii=False),
+					"candidates_json": json.dumps(lite, ensure_ascii=False),
 				}
 			)
-			text = resp.content if hasattr(resp, "content") else str(resp)
-			data = json.loads((text or "{}").strip())
-			accepted = data.get("accepted") or []
+			raw = resp.content if hasattr(resp, "content") else resp
+			if isinstance(raw, (dict, list)):
+				data = raw
+			else:
+				s = str(raw)
+				try:
+					data = json.loads(clean_json_text(s))
+				except Exception:
+					data = {}
+			if isinstance(data, list):
+				accepted = data
+			elif isinstance(data, dict):
+				accepted = data.get("accepted") or []
+			else:
+				accepted = []
 			logger.info("Classifier accepted=%s", len(accepted))
 			# If too few accepted, escalate to stronger model for accuracy
 			if len(accepted) < 3:
@@ -513,15 +585,27 @@ class ComparableFinder:
 				resp2 = chain2.invoke(
 					{
 						"target_name": target["name"],
-						"target_description": target["business_description"],
+						"target_description_short": (target.get("business_description") or "")[:350],
 						"target_sic": target.get("sic", ""),
 						"target_url": target.get("url", ""),
-						"candidates_json": json.dumps(candidates, ensure_ascii=False),
+						"candidates_json": json.dumps(lite, ensure_ascii=False),
 					}
 				)
-				text2 = resp2.content if hasattr(resp2, "content") else str(resp2)
-				data2 = json.loads((text2 or "{}").strip())
-				accepted = data2.get("accepted") or accepted
+				raw2 = resp2.content if hasattr(resp2, "content") else resp2
+				if isinstance(raw2, (dict, list)):
+					data2 = raw2
+				else:
+					s2 = str(raw2)
+					try:
+						data2 = json.loads(clean_json_text(s2))
+					except Exception:
+						data2 = {}
+				if isinstance(data2, list):
+					accepted = data2 or accepted
+				elif isinstance(data2, dict):
+					accepted = data2.get("accepted") or accepted
+				else:
+					accepted = accepted
 				logger.info("Classifier escalation accepted=%s", len(accepted))
 			# Build lookup to preserve symbol/context
 			def _keyify(x: Dict[str, str]) -> str:
@@ -575,7 +659,7 @@ class ComparableFinder:
 					ctx = (orig.get("context") or "")
 					cand_tokens = _tokset(cand.get("name") or "") | _tokset(ctx) | _domain_tokens(cand.get("url") or "")
 					overlap = len(target_tokens & cand_tokens)
-					if overlap >= 4:
+					if overlap >= 2:
 						refined.append(cand)
 				# only apply if we still have a reasonable set
 				if len(refined) >= 3:
@@ -597,11 +681,37 @@ class ComparableFinder:
 			return cached
 		chain = prompt | self.llm
 		logger.info("Calling formatter LLM with %s candidates", len(json.loads(variables["candidates_json"])) if "candidates_json" in variables else "n/a")
-		resp = chain.invoke(variables)
-		text = resp.content if hasattr(resp, "content") else str(resp)
-		data = json.loads(clean_json_text(text))
-		self._cache_set(cache_key, data)
-		return data
+		try:
+			resp = chain.invoke(variables)
+			raw = resp.content if hasattr(resp, "content") else resp
+			if isinstance(raw, dict):
+				data = raw
+			elif isinstance(raw, list):
+				data = {"comparables": raw}
+			else:
+				data = json.loads(clean_json_text(str(raw)))
+			self._cache_set(cache_key, data)
+			return data
+		except Exception:
+			logger.exception("Formatter LLM parse failed; retrying with fewer candidates")
+			try:
+				all_cands = json.loads(variables.get("candidates_json", "[]"))
+				reduced = all_cands[:min(6, max(3, (len(all_cands) // 2) or 3))]
+				vars2 = dict(variables)
+				vars2["candidates_json"] = json.dumps(reduced, ensure_ascii=False)
+				resp2 = chain.invoke(vars2)
+				raw2 = resp2.content if hasattr(resp2, "content") else resp2
+				if isinstance(raw2, dict):
+					data2 = raw2
+				elif isinstance(raw2, list):
+					data2 = {"comparables": raw2}
+				else:
+					data2 = json.loads(clean_json_text(str(raw2)))
+				self._cache_set(cache_key, data2)
+				return data2
+			except Exception:
+				logger.exception("Formatter fallback failed")
+				return {"comparables": []}
 
 	def find_comparables(
 		self,
@@ -610,42 +720,5 @@ class ComparableFinder:
 		target_description: str,
 		target_sic: str = "",
 	) -> Dict[str, Any]:
-		# Gather peers from Finnhub and GPT-5 in parallel to reduce latency
-		with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-			fh_future = ex.submit(self._gather_candidates, target_name, target_url, target_description, target_sic, {})
-			gpt_future = ex.submit(self._gpt_search_candidates, target_name, target_sic, target_description, target_url)
-			fh_candidates = fh_future.result() or []
-			gpt_candidates = gpt_future.result() or []
-		# Combine and dedupe by normalized name
-		combined = (fh_candidates or []) + (gpt_candidates or [])
-		combined = unique_by_key(combined, key_fn=lambda x: re.sub(r"[^A-Za-z0-9]", "", (x.get("name") or "")).lower())
-		# Cap for downstream LLM
-		top_candidates = combined[:TOP_CANDIDATES_FOR_LLM]
-		logger.info("Candidates: finnhub=%s gpt=%s combined=%s top_for_llm=%s",
-		            len(fh_candidates or []), len(gpt_candidates or []), len(combined), len(top_candidates))
-
-		# Tier 1: run classifier and signals in parallel to overlap LLM latencies
-		target = {
-			"name": target_name,
-			"url": target_url,
-			"business_description": target_description,
-			"sic": target_sic,
-		}
-		with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
-			signals_future = ex.submit(self._extract_signals, target_description)
-			classify_future = ex.submit(self._classify_candidates, target, top_candidates)
-			filtered_candidates = classify_future.result() or top_candidates
-			logger.info("Filtered candidates count=%s", len(filtered_candidates))
-			# Tier 2: format/enrich using stronger model (can overlap with signals extraction)
-			prompt = self._compose_prompt(target, filtered_candidates)
-			variables = {
-				"target_name": target_name,
-				"target_url": target_url,
-				"target_description": target_description,
-				"target_sic": target_sic,
-				"candidates_json": json.dumps(filtered_candidates, ensure_ascii=False),
-			}
-			format_future = ex.submit(self._call_llm, prompt, variables)
-			_ = signals_future.result()  # ensure any signal extraction completes (cache warmed)
-			structured = format_future.result()
-			return self._ensure_valid_output(structured, filtered_candidates or top_candidates)
+		# External discovery (Finnhub/Chroma/LLM) removed
+		raise RuntimeError("Company discovery has been disabled (finnhub/chromadb/LLM search removed).")
