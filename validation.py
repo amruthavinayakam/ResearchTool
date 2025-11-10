@@ -35,44 +35,11 @@ _PLACEHOLDER_URL_DOMAINS = {"sec.gov"}
 
 def _sec_headers() -> Dict[str, str]:
 	return {
-		"User-Agent": "ComparableFinder/1.0 (contact: example@example.com)",
+		"User-Agent": "ComparableFinder/1.0 (contact: vamrutha.works@gmail.com)",
 		"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 		"Connection": "keep-alive",
 		"Referer": "https://www.sec.gov/",
 	}
-
-
-def fetch_sic_index() -> List[Dict[str, str]]:
-	"""Scrape the SEC SIC list and return [{'code': '####', 'name': 'Industry'}]."""
-	url = "https://www.sec.gov/search-filings/standard-industrial-classification-sic-code-list"
-	resp = requests.get(url, headers=_sec_headers(), timeout=20)
-	resp.raise_for_status()
-	html = resp.text or ""
-	soup = BeautifulSoup(html, "lxml")
-	entries: List[Dict[str, str]] = []
-	for table in soup.find_all("table"):
-		for tr in table.find_all("tr"):
-			tds = tr.find_all(["td", "th"])
-			if len(tds) < 2:
-				continue
-			code_txt = (tds[0].get_text(strip=True) or "")
-			name_txt = (tds[1].get_text(" ", strip=True) or "")
-			match = re.match(r"^\s*(\d{4})\s*$", code_txt)
-			if match and name_txt:
-				entries.append({"code": match.group(1), "name": name_txt})
-	if not entries:
-		for match in re.finditer(r"\b(\d{4})\b\s*[-:–]\s*([A-Za-z][^\n\r<]+)", html):
-			entries.append({"code": match.group(1), "name": match.group(2).strip()})
-	seen = set()
-	deduped: List[Dict[str, str]] = []
-	for entry in entries:
-		code = entry["code"]
-		if code in seen:
-			continue
-		seen.add(code)
-		deduped.append(entry)
-	logger.info("SEC SIC index parsed=%s deduped=%s", len(entries), len(deduped))
-	return deduped
 
 
 def _parse_sec_browse_page(html: str) -> List[Dict[str, str]]:
@@ -541,7 +508,6 @@ def fetch_serp_peers(
 	serp_api_key: str,
 	max_results: int = 10,
 ) -> List[Dict[str, str]]:
-	"""Use SerpAPI (Google engine) to fetch publicly traded peers/competitors."""
 	name = (target_name or "").strip()
 	if not name or not serp_api_key:
 		return []

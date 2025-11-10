@@ -12,7 +12,6 @@ logger = logging.getLogger(__name__)
 
 from validation import (
 	fetch_companies_by_sic,
-	fetch_sic_index,
 	map_sic_with_llm,
 	filter_companies_with_llm,
 	enrich_company_details_with_llm,
