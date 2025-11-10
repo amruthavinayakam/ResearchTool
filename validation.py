@@ -439,10 +439,9 @@ def map_sic_with_llm(user_input: str, openai_api_key: str) -> Dict[str, Any]:
 	client = OpenAI(api_key=openai_api_key)
 	instruction = (
 		"You are an expert on SEC Standard Industrial Classification (SIC) codes. "
-		"Use at most two SIC codes for the target. If the user supplies SICs, they may provide one or two codes separated by a comma; "
-		"treat the first as primary and the second as optional. The model must return no more than two SIC codes (strictly 4-digit numeric); "
-		"if uncertain, return only one. Respond STRICTLY in JSON with a key 'matches' containing an array (max length 2). "
-		"Each item must include sic_code (string, 4 digits), sic_name (official description), and confidence (float between 0 and 1)."
+		"Given a short industry description, return the single best matching 4-digit SIC code. "
+		"Respond STRICTLY in JSON with fields: sic_code (string, 4 digits), sic_name (official description), confidence (float between 0 and 1). "
+		"If uncertain, pick the highest-confidence code only."
 	)
 	logger.info("map_sic_with_llm: querying LLM with input '%s'", user_input)
 	resp = client.chat.completions.create(
@@ -459,48 +458,28 @@ def map_sic_with_llm(user_input: str, openai_api_key: str) -> Dict[str, Any]:
 		logger.exception("map_sic_with_llm: failed to parse LLM response '%s'", text)
 		raise ValueError(f"OpenAI response parsing failed: {exc}") from exc
 
-	if isinstance(data, list):
-		matches_raw = data
-	elif isinstance(data, dict):
+	candidates: List[Dict[str, Any]] = []
+	if isinstance(data, dict):
 		if isinstance(data.get("matches"), list):
-			matches_raw = data["matches"]
-		elif data.get("sic_code"):
-			matches_raw = [data]
+			candidates = [item for item in data["matches"] if isinstance(item, dict)]
 		else:
-			matches_raw = []
-	else:
-		matches_raw = []
+			candidates = [data]
+	elif isinstance(data, list):
+		candidates = [item for item in data if isinstance(item, dict)]
 
-	if not isinstance(matches_raw, list) or not matches_raw:
-		logger.error("map_sic_with_llm: response missing valid matches structure: %s", data)
-		raise ValueError("LLM response missing 'matches' array.")
-
-	cleaned: List[Dict[str, Any]] = []
-	for item in matches_raw:
-		if not isinstance(item, dict):
-			continue
+	for item in candidates:
 		code = str(item.get("sic_code") or "").strip()
 		name = (item.get("sic_name") or "").strip()
 		confidence = item.get("confidence")
 		if not re.fullmatch(r"\d{4}", code):
 			logger.warning("map_sic_with_llm: skipping invalid sic_code '%s'", code)
 			continue
-		cleaned.append(
-			{
-				"sic_code": code,
-				"sic_name": name or "-",
-				"confidence": confidence,
-			}
-		)
-		if len(cleaned) == 2:
-			break
+		result = {"sic_code": code, "sic_name": name or "-", "confidence": confidence}
+		logger.info("map_sic_with_llm: LLM mapped '%s' -> %s", user_input, result)
+		return result
 
-	if not cleaned:
-		logger.error("map_sic_with_llm: no valid SIC codes returned for input '%s'", user_input)
-		raise ValueError(f"LLM did not return any valid 4-digit SIC codes for input '{user_input}'.")
-
-	logger.info("map_sic_with_llm: LLM mapped '%s' -> %s", user_input, cleaned)
-	return {"matches": cleaned}
+	logger.error("map_sic_with_llm: no valid SIC code returned for input '%s'", user_input)
+	raise ValueError(f"LLM did not return a valid 4-digit SIC code for input '{user_input}'.")
 
 
 def fetch_serp_peers(

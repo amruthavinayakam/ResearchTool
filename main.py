@@ -22,6 +22,69 @@ from validation import (
 st.set_page_config(page_title="Comparable Companies Finder", page_icon="📈", layout="wide")
 
 
+def apply_dark_theme() -> None:
+	st.markdown(
+		"""
+		<style>
+		:root, .stApp {
+			color-scheme: dark;
+		}
+		body {
+			background-color: #0b0d12;
+			color: #f1f5f9;
+		}
+		.stApp {
+			background-color: #0b0d12;
+			color: #f1f5f9;
+		}
+		header, footer {
+			background: transparent;
+		}
+		section[data-testid="stSidebar"] {
+			background-color: #111827 !important;
+			color: #f1f5f9 !important;
+			border-right: 1px solid #1f2937;
+		}
+		section[data-testid="stSidebar"] * {
+			color: #f1f5f9 !important;
+		}
+		h1, h2, h3, h4, h5, h6, label, p, span {
+			color: #f1f5f9 !important;
+		}
+		input, textarea, select {
+			background-color: #1f2937 !important;
+			color: #f1f5f9 !important;
+			border: 1px solid #374151 !important;
+			border-radius: 6px !important;
+		}
+		button, .stButton button {
+			background-color: #2563eb !important;
+			color: #f8fafc !important;
+			border: none !important;
+			border-radius: 6px !important;
+		}
+		.stForm {
+			background-color: #111827;
+			padding: 24px 28px;
+			border-radius: 16px;
+			border: 1px solid #1f2937;
+		}
+		[data-testid="stDataFrame"] {
+			background-color: #0b0d12 !important;
+			color: #f1f5f9 !important;
+		}
+		[data-testid="stDataFrame"] div {
+			color: #f1f5f9 !important;
+		}
+		[data-testid="stTable"] {
+			color: #f1f5f9 !important;
+		}
+		</style>
+		""",
+		unsafe_allow_html=True,
+	)
+
+
 def init_sidebar_keys() -> Dict[str, str]:
 	with st.sidebar:
 		st.header("API Keys")
@@ -45,6 +108,7 @@ def init_sidebar_keys() -> Dict[str, str]:
 
 
 def main() -> None:
+	apply_dark_theme()
 	st.title("Comparable Public Companies Generator")
 	st.write(
 		"Provide target company details. The app will use OpenAI to propose comparable publicly traded companies."
@@ -92,75 +156,43 @@ def main() -> None:
 	with st.spinner("Resolving SIC and fetching companies from SEC..."):
 		try:
 			# Resolve SIC (code or best matching name)
-			resolved_matches: List[Dict[str, Any]] = []
+			resolved_match: Dict[str, Any] = {}
 			sic_list = [part.strip() for part in (sic or "").split(",") if part.strip()]
 			numeric_matches = [code for code in sic_list if re.fullmatch(r"\d{4}", code)]
 			if numeric_matches:
-				try:
-					entries = fetch_sic_index()
-					name_lookup = {entry.get("code"): entry.get("name") for entry in entries}
-				except Exception:
-					name_lookup = {}
-				for idx, code in enumerate(numeric_matches[:2]):
-					resolved_matches.append(
-						{
-							"sic_code": code,
-							"sic_name": name_lookup.get(code) or "-",
-							"confidence": 1.0 if idx == 0 else None,
-						}
-					)
-				st.success(
-					"Resolved SIC (manual): "
-					+ ", ".join(
-						f"{match['sic_code']} — {match.get('sic_name') or '-'}"
-						for match in resolved_matches
-					)
-				)
+				code = numeric_matches[0]
+				resolved_match = {"sic_code": code, "sic_name": "-", "confidence": 1.0}
+				st.success(f"Resolved SIC (manual): {code} — -")
 			else:
-				llm_res = map_sic_with_llm(user_input=sic, openai_api_key=openai_key)
-				matches = llm_res.get("matches") or []
-				if not matches:
-					raise ValueError("LLM did not return any SIC matches.")
-				resolved_matches = matches[:2]
+				resolved_match = map_sic_with_llm(user_input=sic, openai_api_key=openai_key)
 				st.success(
-					"Resolved SIC (LLM): "
-					+ ", ".join(
-						f"{match.get('sic_code')} — {match.get('sic_name') or '-'}"
-						for match in resolved_matches
-					)
+					f"Resolved SIC (LLM): {resolved_match.get('sic_code')} — {resolved_match.get('sic_name') or '-'} "
+					f"(confidence={resolved_match.get('confidence')})"
 				)
-			if not resolved_matches:
-				st.error("Unable to resolve any SIC codes.")
+			if not resolved_match:
+				st.error("Unable to resolve any SIC code.")
 				st.stop()
-			# Fetch companies for each resolved SIC
-			all_companies: List[Dict[str, Any]] = []
-			for order, match in enumerate(resolved_matches):
-				code = (match.get("sic_code") or "").strip()
-				if not code:
-					continue
-				logger.info("main: fetching companies for SIC=%s (order=%s)", code, order)
-				companies = fetch_companies_by_sic(
-					sic_code=code,
-					start=0,
-					count=40,
-					owner="include",
-				)
-				if not companies:
-					logger.info("main: no companies found for SIC=%s", code)
-					continue
-				for entry in companies:
-					entry = dict(entry)
-					entry["_sic_code"] = code
-					entry["_sic_name"] = match.get("sic_name") or "-"
-					entry["_sic_order"] = order
-					all_companies.append(entry)
-			if not all_companies:
-				st.warning("No companies found for the resolved SIC codes on SEC browse-EDGAR.")
+			code = (resolved_match.get("sic_code") or "").strip()
+			if not code:
+				st.error("Resolved SIC code is empty.")
 				st.stop()
-			# Deduplicate by CIK/ticker while preserving order (primary code first)
+			logger.info("main: fetching companies for SIC=%s", code)
+			companies = fetch_companies_by_sic(
+				sic_code=code,
+				start=0,
+				count=40,
+				owner="include",
+			)
+			if not companies:
+				st.warning("No companies found for this SIC on SEC browse-EDGAR.")
+				st.stop()
+			# Deduplicate by CIK/ticker while preserving order
 			unique_companies: List[Dict[str, Any]] = []
 			seen = set()
-			for entry in all_companies:
+			for raw in companies:
+				entry = dict(raw)
+				entry["_sic_code"] = code
+				entry["_sic_name"] = resolved_match.get("sic_name") or "-"
 				key = (entry.get("cik") or "").strip()
 				if not key:
 					key = f"{(entry.get('ticker') or '').upper()}::{(entry.get('exchange') or '').upper()}"
@@ -170,7 +202,7 @@ def main() -> None:
 					continue
 				seen.add(key)
 				unique_companies.append(entry)
-			logger.info("main: aggregated %s unique companies across %s SIC codes", len(unique_companies), len(resolved_matches))
+			logger.info("main: aggregated %s unique companies for SIC %s", len(unique_companies), code)
 			serp_candidates = []
 			if serp_key and company_name:
 				try:
@@ -254,8 +286,8 @@ def main() -> None:
 			if not filtered_comparables:
 				st.warning("No comparable companies remain after filtering.")
 				st.stop()
-			sic_codes_display = ", ".join(match.get("sic_code") for match in resolved_matches if match.get("sic_code"))
-			st.subheader(f"Comparable Companies (SEC, SIC {sic_codes_display})")
+			sic_display = resolved_match.get("sic_code") if isinstance(resolved_match, dict) else None
+			st.subheader(f"Comparable Companies (SEC, SIC {sic_display or 'unknown'})")
 			import pandas as pd
 			df = pd.DataFrame(filtered_comparables, columns=["name","url","exchange","ticker","business_activity","customer_segment","SIC_industry"])
 			st.dataframe(df, use_container_width=True)
